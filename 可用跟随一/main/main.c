@@ -94,10 +94,10 @@ static const char *TAG = "follow_only_dbg";
 #define FR_IMU_YAW_SIGN -1.0f
 
 /* UWB smoothing / outlier rejection. */
-#define FR_UWB_SMOOTH_TAU_S          0.35f
-#define FR_UWB_MAX_TARGET_SPEED_MPS  3.0f
-#define FR_UWB_JUMP_MARGIN_M         0.30f
-#define FR_UWB_REINIT_OUTLIERS       5
+#define FR_UWB_SMOOTH_TAU_S          0.08f
+#define FR_UWB_MAX_TARGET_SPEED_MPS  8.0f
+#define FR_UWB_JUMP_MARGIN_M         0.55f
+#define FR_UWB_REINIT_OUTLIERS       2
 
 /* For motion safety, range-only frames are logged but do not refresh the
  * control target. A range-only frame has no fresh bearing; using it for motion
@@ -118,7 +118,7 @@ static const char *TAG = "follow_only_dbg";
 #define FR_LOG_PATH                  "/spiffs/follow_log.csv"
 #define FR_LOG_QUEUE_LEN             96
 #define FR_LOG_HZ                    5
-#define FR_LIVE_JSON_BUF_SIZE        4096  /* actual JSON ~1.3 KiB; 4 KiB with margin */
+#define FR_LIVE_JSON_BUF_SIZE        6144
 
 /* Startup gate. */
 #define FR_STARTUP_LOG_INTERVAL_MS   1000
@@ -138,6 +138,13 @@ static float wrap_pi(float a)
     while (a > (float)M_PI) a -= 2.0f * (float)M_PI;
     while (a < -(float)M_PI) a += 2.0f * (float)M_PI;
     return a;
+}
+
+static float apply_deadband(float x, float db)
+{
+    if (fabsf(x) < db) return 0.0f;
+    const float s = (x >= 0.0f) ? 1.0f : -1.0f;
+    return s * (fabsf(x) - db) / (1.0f - db);
 }
 
 static float ramp(float current, float target, float rate, float dt)
@@ -322,6 +329,16 @@ static void lock(void) { xSemaphoreTake(g_shared.lock, portMAX_DELAY); }
 static void unlock(void) { xSemaphoreGive(g_shared.lock); }
 
 /* ---------------- Remote state ---------------- */
+typedef enum {
+    APP_MODE_FOLLOW = 0,
+    APP_MODE_REMOTE,
+} app_mode_t;
+
+static const char *app_mode_name(app_mode_t mode)
+{
+    return (mode == APP_MODE_REMOTE) ? "remote" : "follow";
+}
+
 typedef struct {
     bool client_connected;
     bool estop_latched;
@@ -336,12 +353,25 @@ typedef struct {
     uint32_t timeout_count;
     uint32_t connect_count;
     uint32_t disconnect_count;
+    app_mode_t mode;
+    uint8_t follow_speed_pct;
+    uint8_t follow_turn_pct;
+    uint8_t remote_speed_pct;
+    float manual_x;
+    float manual_y;
+    bool manual_deadman;
+    uint32_t manual_seq;
+    uint64_t manual_cmd_us;
 } remote_state_t;
 
 static remote_state_t s_remote = {
     .client_connected = false,
     .estop_latched = true,
     .motion_armed = false,
+    .mode = APP_MODE_FOLLOW,
+    .follow_speed_pct = 75,
+    .follow_turn_pct = 65,
+    .remote_speed_pct = 70,
 };
 static portMUX_TYPE s_remote_mux = portMUX_INITIALIZER_UNLOCKED;
 static httpd_handle_t s_httpd = NULL;
@@ -388,6 +418,10 @@ static void remote_estop(uint64_t t)
     portENTER_CRITICAL(&s_remote_mux);
     s_remote.estop_latched = true;
     s_remote.motion_armed = false;
+    s_remote.manual_x = 0.0f;
+    s_remote.manual_y = 0.0f;
+    s_remote.manual_deadman = false;
+    s_remote.manual_cmd_us = t;
     s_remote.last_cmd_us = t;
     s_remote.estop_count++;
     portEXIT_CRITICAL(&s_remote_mux);
@@ -411,8 +445,55 @@ static void remote_motion_off(uint64_t t)
 {
     portENTER_CRITICAL(&s_remote_mux);
     s_remote.motion_armed = false;
+    s_remote.manual_x = 0.0f;
+    s_remote.manual_y = 0.0f;
+    s_remote.manual_deadman = false;
+    s_remote.manual_cmd_us = t;
     s_remote.last_cmd_us = t;
     s_remote.motion_off_count++;
+    portEXIT_CRITICAL(&s_remote_mux);
+}
+
+static void remote_set_mode(app_mode_t mode, uint64_t t)
+{
+    portENTER_CRITICAL(&s_remote_mux);
+    s_remote.mode = mode;
+    s_remote.manual_x = 0.0f;
+    s_remote.manual_y = 0.0f;
+    s_remote.manual_deadman = false;
+    s_remote.manual_cmd_us = t;
+    s_remote.last_cmd_us = t;
+    portEXIT_CRITICAL(&s_remote_mux);
+}
+
+static void remote_set_tuning(int follow_speed_pct,
+                              int follow_turn_pct,
+                              int remote_speed_pct,
+                              uint64_t t)
+{
+    portENTER_CRITICAL(&s_remote_mux);
+    if (follow_speed_pct >= 0) {
+        s_remote.follow_speed_pct = (uint8_t)clamp_int(follow_speed_pct, 0, 100);
+    }
+    if (follow_turn_pct >= 0) {
+        s_remote.follow_turn_pct = (uint8_t)clamp_int(follow_turn_pct, 0, 100);
+    }
+    if (remote_speed_pct >= 0) {
+        s_remote.remote_speed_pct = (uint8_t)clamp_int(remote_speed_pct, 0, 100);
+    }
+    s_remote.last_cmd_us = t;
+    portEXIT_CRITICAL(&s_remote_mux);
+}
+
+static void remote_set_manual_cmd(float x, float y, bool deadman, uint32_t seq, uint64_t t)
+{
+    portENTER_CRITICAL(&s_remote_mux);
+    s_remote.manual_x = clampf(x, -1.0f, 1.0f);
+    s_remote.manual_y = clampf(y, -1.0f, 1.0f);
+    s_remote.manual_deadman = deadman;
+    s_remote.manual_seq = seq;
+    s_remote.manual_cmd_us = t;
+    s_remote.last_cmd_us = t;
     portEXIT_CRITICAL(&s_remote_mux);
 }
 
@@ -734,7 +815,7 @@ static void uwb_publish_twr(int x_cm, int y_cm, int distance_cm)
 
         if (!reinit) {
             float alpha = dt / (FR_UWB_SMOOTH_TAU_S + dt);
-            alpha = clampf(alpha, 0.05f, 0.85f);
+            alpha = clampf(alpha, 0.25f, 0.95f);
             new_fwd = prev_fwd + alpha * (fwd_m - prev_fwd);
             new_left = prev_left + alpha * (left_m - prev_left);
         }
@@ -818,7 +899,7 @@ static void uwb_task(void *arg)
     int cons_parse_errors = 0;
 
     while (1) {
-        if (bu_uwb_read_line(line, sizeof(line), 200) != ESP_OK) {
+        if (bu_uwb_read_line(line, sizeof(line), 30) != ESP_OK) {
             /* read_line normally blocks up to the timeout and yields the CPU.
              * If it returns immediately with a hard UART error (framing / overflow),
              * give the scheduler a tick so other tasks don't starve. */
@@ -882,33 +963,42 @@ static esp_err_t http_send_text(httpd_req_t *req, const char *text, const char *
 static const char s_index_html[] =
 "<!doctype html><html><head>"
 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<title>Follow UWB Debug</title>"
+"<title>Follow / Remote Control</title>"
 "<style>"
-"body{font-family:Arial,sans-serif;background:#101214;color:#eee;margin:18px;}"
-"button{font-size:20px;padding:14px 18px;margin:6px;border:0;border-radius:10px;}"
-"#stop{background:#d00000;color:white;width:100%;height:92px;font-size:38px;font-weight:bold;}"
-"#arm{background:#008f5a;color:white;}#off{background:#555;color:white;}#clearlog{background:#7655d9;color:white;}"
-"pre{white-space:pre-wrap;background:#1e2329;padding:12px;border-radius:10px;font-size:14px;}"
-"#summary{background:#18202a;border:1px solid #38506a;border-radius:10px;padding:12px;margin:12px 0;font-size:18px;line-height:1.45;}"
-"#summary b{font-size:26px;color:#8cc8ff;}"
-"a{color:#8cc8ff;} .warn{color:#ffd166;}"
+"body{font-family:Arial,sans-serif;background:#0f1215;color:#eee;margin:14px;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;}"
+"button{font-size:18px;padding:13px 16px;margin:5px;border:0;border-radius:8px;background:#2a333d;color:#eee;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;touch-action:none;}"
+"button.active{background:#0078d4;color:white;}button.drive{height:76px;min-width:76px;background:#314151;font-size:34px;line-height:1;}button.stopbtn{background:#6b3030;font-size:18px;font-weight:bold;}"
+"#stop{background:#d00000;color:white;width:100%;height:82px;font-size:34px;font-weight:bold;}"
+"#arm{background:#008f5a;color:white;}#off{background:#555;color:white;}"
+".panel{background:#18202a;border:1px solid #38506a;border-radius:8px;padding:12px;margin:10px 0;}"
+".row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row>*{flex:1}.small{font-size:14px;color:#b8c4cf}.dpad{display:grid;grid-template-columns:76px 76px 76px;grid-template-rows:76px 76px 76px;gap:8px;justify-content:center;touch-action:none}.blank{width:76px;height:76px;}"
+"input[type=range]{width:100%;}pre{white-space:pre-wrap;background:#1e2329;padding:10px;border-radius:8px;font-size:12px;}"
+"#summary{font-size:17px;line-height:1.45;}#summary b{font-size:24px;color:#8cc8ff;} .warn{color:#ffd166;}"
 "</style></head><body>"
-"<h2>Follow-only UWB Debug</h2>"
-"<p class='warn'>CLEAR / ARM latches motion_allowed=true. STOP latches it false.</p>"
+"<h2>Follow / Remote</h2>"
 "<button id='stop' onclick='estop()'>STOP</button><br>"
-"<button id='arm' onclick='arm()'>CLEAR / ARM</button>"
-"<button id='off' onclick='motionOff()'>MOTION OFF</button>"
-"<button id='clearlog' onclick='clearLog()'>CLEAR LOG</button>"
-"<p><a href='/log' target='_blank'>Download CSV log</a></p>"
-"<div id='summary'>waiting for live data...</div>"
+"<button id='arm' onclick='arm()'>CLEAR / ARM</button><button id='off' onclick='motionOff()'>MOTION OFF</button>"
+"<div class='panel'><div class='row'><button id='mf' onclick=\"setMode('follow')\">跟随模式</button><button id='mr' onclick=\"setMode('remote')\">遥控模式</button></div>"
+"<div class='small'>Follow speed <span id='fsv'>--</span>%</div><input id='fs' type='range' min='0' max='100' value='75' oninput='tuneNow()' onchange='tuneNow(true)'>"
+"<div class='small'>Follow turn <span id='ftv'>--</span>%</div><input id='ft' type='range' min='0' max='100' value='65' oninput='tuneNow()' onchange='tuneNow(true)'>"
+"<div class='small'>Remote speed <span id='msv'>--</span>%</div><input id='ms' type='range' min='0' max='100' value='70' oninput='tuneNow()' onchange='tuneNow(true)'></div>"
+"<div id='remotePanel' class='panel'><div class='dpad'><div class='blank'></div><button class='drive' data-x='0' data-y='1'>&#9650;</button><div class='blank'></div>"
+"<button class='drive' data-x='1' data-y='0'>&#9664;</button><button class='drive stopbtn' data-x='0' data-y='0'>STOP</button><button class='drive' data-x='-1' data-y='0'>&#9654;</button>"
+"<div class='blank'></div><button class='drive' data-x='0' data-y='-0.65'>&#9660;</button><div class='blank'></div></div></div>"
+"<div id='summary' class='panel'>waiting for live data...</div>"
 "<div id='errmsg' style='color:red;font-weight:bold'></div>"
 "<pre id='live'>loading...</pre>"
 "<script>"
 "function f(x,d){return (x===undefined||x===null||!isFinite(Number(x)))?'--':Number(x).toFixed(d);}"
-"function render(j){let r=j.remote||{},t=j.target||{},u=j.uwb||{},c=j.control||{};"
+"let tuneTimer=null,tuneHoldUntil=0,seq=1,lastMode='follow',holdX=0,holdY=0,holdD=false;"
+"function render(j){let r=j.remote||{},t=j.target||{},u=j.uwb||{},c=j.control||{},m=j.mode||{};"
 "document.getElementById('errmsg').textContent='';"
+"lastMode=m.name||'follow';document.getElementById('mf').className=lastMode==='follow'?'active':'';document.getElementById('mr').className=lastMode==='remote'?'active':'';"
+"document.getElementById('remotePanel').style.display=lastMode==='remote'?'block':'none';"
+"if(Date.now()>tuneHoldUntil&&['fs','ft','ms'].indexOf(document.activeElement&&document.activeElement.id)<0){['fs','ft','ms'].forEach(function(id){let k=id==='fs'?'follow_speed_pct':id==='ft'?'follow_turn_pct':'remote_speed_pct';if(m[k]!==undefined)document.getElementById(id).value=m[k];});}"
+"document.getElementById('fsv').textContent=document.getElementById('fs').value;document.getElementById('ftv').textContent=document.getElementById('ft').value;document.getElementById('msv').textContent=document.getElementById('ms').value;"
 "document.getElementById('summary').innerHTML="
-"'<b>Distance '+f(t.distance_m,2)+' m</b> &nbsp; Bearing '+f(t.bearing_deg,1)+' deg<br>' +"
+"'<b>'+lastMode.toUpperCase()+'</b> &nbsp; Distance '+f(t.distance_m,2)+' m &nbsp; Bearing '+f(t.bearing_deg,1)+' deg<br>' +"
 "'UWB filtered: d='+f(u.filtered_distance_m,2)+' m, bearing='+f(u.bearing_deg,1)+' deg; raw: d='+f(u.raw_distance_m,2)+' m, bearing='+f(u.raw_bearing_deg,1)+' deg<br>' +"
 "'target_valid='+t.valid+', age='+t.age_ms+' ms, frame='+u.frame_type+', stale_bearing='+u.bearing_stale+'<br>' +"
 "'applied v='+f(c.applied_v_mps,2)+' m/s, w='+f(c.applied_w_rps,2)+' rad/s, armed='+r.motion_armed+', motion_allowed='+r.motion_allowed+'<br>' +"
@@ -919,8 +1009,14 @@ static const char s_index_html[] =
 "async function estop(){if(await post('/estop'))await poll();}"
 "async function arm(){if(await post('/clear'))await poll();}"
 "async function motionOff(){if(await post('/motion_off'))await poll();}"
-"async function clearLog(){if(await post('/clear_log'))await poll();}"
-"async function hb(){ft('/hb',{method:'POST',cache:'no-store'},2000).catch(function(){});}"
+"async function setMode(m){await post('/mode?m='+m);sendCmd(0,0,false);await poll();}"
+"function tuneNow(force){let a=document.getElementById('fs'),b=document.getElementById('ft'),c=document.getElementById('ms');tuneHoldUntil=Date.now()+2000;document.getElementById('fsv').textContent=a.value;document.getElementById('ftv').textContent=b.value;document.getElementById('msv').textContent=c.value;let url='/tune?fs='+a.value+'&ft='+b.value+'&ms='+c.value;clearTimeout(tuneTimer);if(force){post(url);return;}tuneTimer=setTimeout(function(){post(url);},40);}"
+"function sendCmd(x,y,d){holdX=Number(x);holdY=Number(y);holdD=!!d;post('/cmd?x='+holdX+'&y='+holdY+'&d='+(holdD?1:0)+'&q='+(seq++));}"
+"document.addEventListener('contextmenu',function(e){if(e.target.closest('.drive'))e.preventDefault();});"
+"document.addEventListener('selectstart',function(e){if(e.target.closest('.drive'))e.preventDefault();});"
+"document.addEventListener('pointerdown',function(e){let b=e.target.closest('.drive');if(!b)return;e.preventDefault();try{b.setPointerCapture(e.pointerId);}catch(_e){}sendCmd(b.dataset.x,b.dataset.y,true);});"
+"document.addEventListener('pointerup',function(e){if(e.target.closest('.drive')){e.preventDefault();sendCmd(0,0,false);}});document.addEventListener('pointercancel',function(){sendCmd(0,0,false);});document.addEventListener('pointerleave',function(e){if(e.target.closest('.drive'))sendCmd(0,0,false);});"
+"setInterval(function(){if(lastMode==='remote'&&holdD)sendCmd(holdX,holdY,true);},180);"
 "var pollBusy=false,hbBusy=false;"
 "var nextPollDelay=400;"
 "async function poll(){"
@@ -973,6 +1069,64 @@ static esp_err_t motion_off_handler(httpd_req_t *req)
     return http_send_text(req, "MOTION_OFF\n", "text/plain");
 }
 
+static bool query_value(httpd_req_t *req, const char *key, char *out, size_t out_len)
+{
+    char query[160];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return false;
+    }
+    return httpd_query_key_value(query, key, out, out_len) == ESP_OK;
+}
+
+static int query_int(httpd_req_t *req, const char *key, int fallback)
+{
+    char value[24];
+    if (!query_value(req, key, value, sizeof(value))) {
+        return fallback;
+    }
+    return atoi(value);
+}
+
+static float query_float(httpd_req_t *req, const char *key, float fallback)
+{
+    char value[24];
+    if (!query_value(req, key, value, sizeof(value))) {
+        return fallback;
+    }
+    return strtof(value, NULL);
+}
+
+static esp_err_t mode_handler(httpd_req_t *req)
+{
+    char mode[16] = {0};
+    app_mode_t next = APP_MODE_FOLLOW;
+    if (query_value(req, "m", mode, sizeof(mode)) && strcmp(mode, "remote") == 0) {
+        next = APP_MODE_REMOTE;
+    }
+    remote_set_mode(next, now_us());
+    ESP_LOGW(TAG, "mode switched to %s", app_mode_name(next));
+    return http_send_text(req, "OK\n", "text/plain");
+}
+
+static esp_err_t tune_handler(httpd_req_t *req)
+{
+    const int fs = query_int(req, "fs", -1);
+    const int ft = query_int(req, "ft", -1);
+    const int ms = query_int(req, "ms", -1);
+    remote_set_tuning(fs, ft, ms, now_us());
+    return http_send_text(req, "OK\n", "text/plain");
+}
+
+static esp_err_t cmd_handler(httpd_req_t *req)
+{
+    const float x = query_float(req, "x", 0.0f);
+    const float y = query_float(req, "y", 0.0f);
+    const bool deadman = query_int(req, "d", 0) != 0;
+    const uint32_t seq = (uint32_t)query_int(req, "q", 0);
+    remote_set_manual_cmd(x, y, deadman, seq, now_us());
+    return http_send_text(req, "OK\n", "text/plain");
+}
+
 static esp_err_t clear_log_handler(httpd_req_t *req)
 {
     s_clear_log_requested = true;
@@ -1009,6 +1163,9 @@ static esp_err_t live_handler(httpd_req_t *req)
              "\"heartbeat_age_ms\":%lu,\"heartbeat_timeout_ms\":%lu,"
              "\"heartbeat_count\":%lu,\"connect_count\":%lu,\"disconnect_count\":%lu,"
              "\"timeout_count\":%lu},"
+             "\"mode\":{\"name\":\"%s\",\"follow_speed_pct\":%u,\"follow_turn_pct\":%u,"
+             "\"remote_speed_pct\":%u,\"manual_x\":%.3f,\"manual_y\":%.3f,"
+             "\"manual_deadman\":%s,\"manual_age_ms\":%lu,\"manual_seq\":%lu},"
              "\"target\":{\"valid\":%s,\"age_ms\":%lu,"
              "\"distance_m\":%.3f,\"bearing_rad\":%.4f,\"bearing_deg\":%.2f},"
              "\"uwb\":{"
@@ -1048,6 +1205,16 @@ static esp_err_t live_handler(httpd_req_t *req)
              (unsigned long)r.connect_count,
              (unsigned long)r.disconnect_count,
              (unsigned long)r.timeout_count,
+             app_mode_name(r.mode),
+             (unsigned)r.follow_speed_pct,
+             (unsigned)r.follow_turn_pct,
+             (unsigned)r.remote_speed_pct,
+             r.manual_x,
+             r.manual_y,
+             r.manual_deadman ? "true" : "false",
+             (unsigned long)((r.manual_cmd_us != 0 && t >= r.manual_cmd_us)
+                             ? ((t - r.manual_cmd_us) / 1000ULL) : 0xffffffffu),
+             (unsigned long)r.manual_seq,
              rec.target_valid ? "true" : "false",
              (unsigned long)rec.target_age_ms,
              rec.target_distance_m,
@@ -1161,6 +1328,9 @@ static esp_err_t remote_http_start(void)
     httpd_uri_t uri_estop      = {.uri = "/estop",      .method = HTTP_POST, .handler = estop_handler};
     httpd_uri_t uri_clear      = {.uri = "/clear",      .method = HTTP_POST, .handler = clear_handler};
     httpd_uri_t uri_motion_off = {.uri = "/motion_off", .method = HTTP_POST, .handler = motion_off_handler};
+    httpd_uri_t uri_mode       = {.uri = "/mode",       .method = HTTP_POST, .handler = mode_handler};
+    httpd_uri_t uri_tune       = {.uri = "/tune",       .method = HTTP_POST, .handler = tune_handler};
+    httpd_uri_t uri_cmd        = {.uri = "/cmd",        .method = HTTP_POST, .handler = cmd_handler};
     httpd_uri_t uri_live       = {.uri = "/live",       .method = HTTP_GET,  .handler = live_handler};
     httpd_uri_t uri_status     = {.uri = "/status",     .method = HTTP_GET,  .handler = live_handler};
     httpd_uri_t uri_log        = {.uri = "/log",        .method = HTTP_GET,  .handler = log_download_handler};
@@ -1171,6 +1341,9 @@ static esp_err_t remote_http_start(void)
     httpd_register_uri_handler(s_httpd, &uri_estop);
     httpd_register_uri_handler(s_httpd, &uri_clear);
     httpd_register_uri_handler(s_httpd, &uri_motion_off);
+    httpd_register_uri_handler(s_httpd, &uri_mode);
+    httpd_register_uri_handler(s_httpd, &uri_tune);
+    httpd_register_uri_handler(s_httpd, &uri_cmd);
     httpd_register_uri_handler(s_httpd, &uri_live);
     httpd_register_uri_handler(s_httpd, &uri_status);
     httpd_register_uri_handler(s_httpd, &uri_log);
@@ -1196,7 +1369,7 @@ static void remote_wifi_event_handler(void *arg,
         remote_set_client_connected(true, now_us());
     } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *e = (wifi_event_ap_stadisconnected_t *)event_data;
-        ESP_LOGW(TAG, "phone/client disconnected, AID=%d -> E-STOP", e->aid);
+        ESP_LOGW(TAG, "phone/client disconnected, AID=%d; motion latch unchanged", e->aid);
         remote_set_client_connected(false, now_us());
     }
 }
@@ -1282,11 +1455,11 @@ static void control_task(void *arg)
     const int esc_min_us = CONFIG_FOLLOW_ONLY_ESC_MIN_US;
     const int esc_mid_us = CONFIG_FOLLOW_ONLY_ESC_MID_US;
     const int esc_max_us = CONFIG_FOLLOW_ONLY_ESC_MAX_US;
-    const float kp_dist = CONFIG_FOLLOW_ONLY_KP_DIST / 1000.0f;
-    const float kp_bear = CONFIG_FOLLOW_ONLY_KP_BEAR / 1000.0f;
-    const float max_lin_accel = 0.8f;
-    const float max_lin_decel = 2.0f;
-    const float max_ang_accel = 6.0f;
+    const float kp_dist = (CONFIG_FOLLOW_ONLY_KP_DIST / 1000.0f) * 1.35f;
+    const float kp_bear = (CONFIG_FOLLOW_ONLY_KP_BEAR / 1000.0f) * 1.10f;
+    const float max_lin_accel = 2.4f;
+    const float max_lin_decel = 3.0f;
+    const float max_ang_accel = 22.0f;
     const float search_rps = CONFIG_FOLLOW_ONLY_SEARCH_ANGULAR_MRADPS / 1000.0f;
     const float search_timeout_s = (float)CONFIG_FOLLOW_ONLY_SEARCH_TIMEOUT_S;
     const uint64_t target_fresh_us = 30000ULL * 1000ULL;
@@ -1301,6 +1474,7 @@ static void control_task(void *arg)
     bool has_last_known = false;
     float yaw_ref = 0.0f;
     bool yaw_ref_set = false;
+    app_mode_t last_mode = APP_MODE_FOLLOW;
 
     const TickType_t period = pdMS_TO_TICKS(1000 / CONFIG_FOLLOW_ONLY_CONTROL_HZ);
     TickType_t last_wake = xTaskGetTickCount();
@@ -1343,6 +1517,14 @@ static void control_task(void *arg)
         uwb = g_shared.uwb;
         unlock();
 
+        remote_state_t r;
+        remote_get_snapshot(&r);
+        if (r.mode != last_mode) {
+            ramp_v_cmd = 0.0f;
+            ramp_w_cmd = 0.0f;
+            last_mode = r.mode;
+        }
+
         if (tgt_valid) {
             lost_timer_s = 0.0f;
             search_timer_s = 0.0f;
@@ -1384,10 +1566,17 @@ static void control_task(void *arg)
             }
             algo_v = clampf(algo_v, 0.0f, max_linear_mps);
 
-            algo_w = kp_bear * tgt_bear;
+            if (fabsf(tgt_bear) < DEG2RAD(8.0f) || fabsf(uwb.filt_left_m) < 0.18f) {
+                algo_w = 0.0f;
+            } else {
+                algo_w = kp_bear * tgt_bear + 0.85f * uwb.bearing_rate_rps;
+            }
+            if (fabsf(tgt_bear) < DEG2RAD(12.0f)) {
+                algo_w *= 0.70f;
+            }
             algo_w = clampf(algo_w, -max_angular_rps, max_angular_rps);
 
-            float turn_scale = clampf(1.0f - fabsf(tgt_bear) / (0.5f * (float)M_PI), 0.0f, 1.0f);
+            float turn_scale = clampf(1.0f - 0.18f * fabsf(tgt_bear) / (0.5f * (float)M_PI), 0.76f, 1.0f);
             algo_v *= turn_scale;
 
             float yaw_meas;
@@ -1405,6 +1594,36 @@ static void control_task(void *arg)
         } else {
             algo_v = 0.0f;
             algo_w = 0.0f;
+        }
+
+        if (r.mode == APP_MODE_REMOTE) {
+            const uint32_t manual_age_ms =
+                (r.manual_cmd_us != 0 && t >= r.manual_cmd_us)
+                    ? (uint32_t)((t - r.manual_cmd_us) / 1000ULL)
+                    : 0xffffffffu;
+            const bool manual_active = r.manual_deadman && manual_age_ms <= 700;
+            if (manual_active) {
+                const float remote_scale = clampf((float)r.remote_speed_pct / 100.0f, 0.0f, 1.0f);
+                const float x = apply_deadband(r.manual_x, 0.04f);
+                const float y = apply_deadband(r.manual_y, 0.04f);
+                const float y2 = y * fabsf(y);
+                const float x2 = x * fabsf(x);
+                algo_v = (y2 >= 0.0f) ? y2 * max_linear_mps * remote_scale
+                                      : y2 * max_linear_mps * 0.65f * remote_scale;
+                algo_w = x2 * max_angular_rps * remote_scale * 1.25f;
+            } else {
+                algo_v = 0.0f;
+                algo_w = 0.0f;
+            }
+            yaw_ref_set = false;
+            state = FOLLOW_STATE_IDLE;
+        } else {
+            const float follow_speed_scale = clampf((float)r.follow_speed_pct / 100.0f, 0.0f, 1.0f);
+            const float follow_turn_scale = clampf((float)r.follow_turn_pct / 100.0f, 0.0f, 1.0f);
+            const float follow_max_v = clampf(max_linear_mps * follow_speed_scale, 0.0f, max_wheel_mps);
+            const float follow_max_w = max_angular_rps * follow_turn_scale;
+            algo_v = clampf(algo_v * follow_speed_scale, 0.0f, follow_max_v);
+            algo_w = clampf(algo_w * follow_turn_scale, -follow_max_w, follow_max_w);
         }
 
         /* Optional extra debug limits before ramping.
@@ -1465,8 +1684,6 @@ static void control_task(void *arg)
         float mw = 0.0f;
         chassis_get_measured(chassis, &mv, &mw, NULL, NULL);
 
-        remote_state_t r;
-        remote_get_snapshot(&r);
         uint32_t hb_age_ms = 0xffffffffu;
         if (r.last_heartbeat_us != 0 && t >= r.last_heartbeat_us) {
             hb_age_ms = (uint32_t)((t - r.last_heartbeat_us) / 1000ULL);

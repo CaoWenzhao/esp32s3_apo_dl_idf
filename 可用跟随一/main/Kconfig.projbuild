@@ -77,7 +77,7 @@ config FOLLOW_ONLY_TRACK_WIDTH_MM
 
 config FOLLOW_ONLY_MAX_WHEEL_SPEED_MMPS
     int "Top wheel speed (mm/s): sets feed-forward gain and clamps set-points"
-    default 800
+    default 900
 
 comment "--- Follow behaviour ---"
 
@@ -91,7 +91,7 @@ config FOLLOW_ONLY_STOP_BAND_MM
 
 config FOLLOW_ONLY_MAX_LINEAR_MMPS
     int "Max follow linear speed (mm/s)"
-    default 700
+    default 900
 
 config FOLLOW_ONLY_MAX_ANGULAR_MRADPS
     int "Max yaw rate (milli-rad/s)"
