@@ -36,6 +36,8 @@
 #include "esp_spiffs.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_oneshot.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
@@ -118,7 +120,22 @@ static const char *TAG = "follow_only_dbg";
 #define FR_LOG_PATH                  "/spiffs/follow_log.csv"
 #define FR_LOG_QUEUE_LEN             96
 #define FR_LOG_HZ                    5
-#define FR_LIVE_JSON_BUF_SIZE        6144
+#define FR_LIVE_JSON_BUF_SIZE        7168
+
+/* ADC1_CH2 = GPIO3: 6S battery divider.
+ * ADC1_CH7 = GPIO8: pressure sensor analog output.
+ */
+#define FR_BATTERY_ADC_CHANNEL       ADC_CHANNEL_2
+#define FR_PRESSURE_ADC_CHANNEL      ADC_CHANNEL_7
+#define FR_ADC_ATTEN                 ADC_ATTEN_DB_12
+#define FR_ADC_BITWIDTH              ADC_BITWIDTH_DEFAULT
+#define FR_BAT_DIV_TOP_KOHM          98.6f
+#define FR_BAT_DIV_BOTTOM_KOHM       9.84f
+#define FR_BAT_6S_EMPTY_V            19.8f
+#define FR_BAT_6S_FULL_V             25.2f
+#define FR_PRESSURE_ZERO_KG          15.2f
+#define FR_PRESSURE_ZERO_RAW_THRESH  24
+#define FR_PRESSURE_KG_PER_VOLT      10.0f
 
 /* Startup gate. */
 #define FR_STARTUP_LOG_INTERVAL_MS   1000
@@ -325,8 +342,146 @@ static imu_i2c_t s_imu;
 static bool s_imu_ok = false;
 static chassis_t s_chassis;
 
+typedef struct {
+    bool valid;
+    uint64_t ts_us;
+    int battery_raw;
+    int battery_mv;
+    float battery_voltage_v;
+    float battery_pct;
+    int pressure_raw;
+    int pressure_mv;
+    float pressure_voltage_v;
+    float weight_kg;
+} analog_status_t;
+
+static analog_status_t s_analog;
+static portMUX_TYPE s_analog_mux = portMUX_INITIALIZER_UNLOCKED;
+
 static void lock(void) { xSemaphoreTake(g_shared.lock, portMAX_DELAY); }
 static void unlock(void) { xSemaphoreGive(g_shared.lock); }
+
+static void analog_set_snapshot(const analog_status_t *in)
+{
+    portENTER_CRITICAL(&s_analog_mux);
+    s_analog = *in;
+    portEXIT_CRITICAL(&s_analog_mux);
+}
+
+static void analog_get_snapshot(analog_status_t *out)
+{
+    portENTER_CRITICAL(&s_analog_mux);
+    *out = s_analog;
+    portEXIT_CRITICAL(&s_analog_mux);
+}
+
+static bool adc_calibration_init(adc_unit_t unit,
+                                 adc_atten_t atten,
+                                 adc_cali_handle_t *out_handle)
+{
+    adc_cali_curve_fitting_config_t cali_config = {
+        .unit_id = unit,
+        .atten = atten,
+        .bitwidth = FR_ADC_BITWIDTH,
+    };
+    if (adc_cali_create_scheme_curve_fitting(&cali_config, out_handle) == ESP_OK) {
+        return true;
+    }
+
+    *out_handle = NULL;
+    return false;
+}
+
+static int adc_raw_to_mv(adc_cali_handle_t cali, int raw)
+{
+    int mv = 0;
+    if (cali && adc_cali_raw_to_voltage(cali, raw, &mv) == ESP_OK) {
+        return mv;
+    }
+
+    return (int)((float)raw * 3300.0f / 4095.0f + 0.5f);
+}
+
+static float battery_pct_from_voltage(float v)
+{
+    float pct = (v - FR_BAT_6S_EMPTY_V) * 100.0f / (FR_BAT_6S_FULL_V - FR_BAT_6S_EMPTY_V);
+    return clampf(pct, 0.0f, 100.0f);
+}
+
+static void analog_task(void *arg)
+{
+    (void)arg;
+
+    adc_oneshot_unit_handle_t adc = NULL;
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    if (adc_oneshot_new_unit(&unit_cfg, &adc) != ESP_OK) {
+        ESP_LOGE(TAG, "ADC unit init failed; battery/weight disabled");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = FR_ADC_ATTEN,
+        .bitwidth = FR_ADC_BITWIDTH,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc, FR_BATTERY_ADC_CHANNEL, &chan_cfg));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc, FR_PRESSURE_ADC_CHANNEL, &chan_cfg));
+
+    adc_cali_handle_t cali = NULL;
+    const bool calibrated = adc_calibration_init(ADC_UNIT_1, FR_ADC_ATTEN, &cali);
+    ESP_LOGI(TAG, "analog monitor started: battery GPIO3/ADC1_CH2, pressure GPIO8/ADC1_CH7, cali=%d",
+             calibrated ? 1 : 0);
+
+    while (1) {
+        int bat_sum = 0;
+        int press_sum = 0;
+        int bat_ok = 0;
+        int press_ok = 0;
+
+        for (int i = 0; i < 12; ++i) {
+            int raw = 0;
+            if (adc_oneshot_read(adc, FR_BATTERY_ADC_CHANNEL, &raw) == ESP_OK) {
+                bat_sum += raw;
+                bat_ok++;
+            }
+            if (adc_oneshot_read(adc, FR_PRESSURE_ADC_CHANNEL, &raw) == ESP_OK) {
+                press_sum += raw;
+                press_ok++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+
+        if (bat_ok > 0 && press_ok > 0) {
+            const int bat_raw = bat_sum / bat_ok;
+            const int press_raw = press_sum / press_ok;
+            const int bat_mv = adc_raw_to_mv(cali, bat_raw);
+            const int press_mv = adc_raw_to_mv(cali, press_raw);
+            const float adc_bat_v = (float)bat_mv / 1000.0f;
+            const float battery_v = adc_bat_v *
+                ((FR_BAT_DIV_TOP_KOHM + FR_BAT_DIV_BOTTOM_KOHM) / FR_BAT_DIV_BOTTOM_KOHM);
+            const float press_v = (float)press_mv / 1000.0f;
+            const float extra_kg = (press_raw <= FR_PRESSURE_ZERO_RAW_THRESH)
+                ? 0.0f : (press_v * FR_PRESSURE_KG_PER_VOLT);
+            analog_status_t st = {
+                .valid = true,
+                .ts_us = now_us(),
+                .battery_raw = bat_raw,
+                .battery_mv = bat_mv,
+                .battery_voltage_v = battery_v,
+                .battery_pct = battery_pct_from_voltage(battery_v),
+                .pressure_raw = press_raw,
+                .pressure_mv = press_mv,
+                .pressure_voltage_v = press_v,
+                .weight_kg = FR_PRESSURE_ZERO_KG + extra_kg,
+            };
+            analog_set_snapshot(&st);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+}
 
 /* ---------------- Remote state ---------------- */
 typedef enum {
@@ -971,6 +1126,7 @@ static const char s_index_html[] =
 "#stop{background:#d00000;color:white;width:100%;height:82px;font-size:34px;font-weight:bold;}"
 "#arm{background:#008f5a;color:white;}#off{background:#555;color:white;}"
 ".panel{background:#18202a;border:1px solid #38506a;border-radius:8px;padding:12px;margin:10px 0;}"
+".cards{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:10px 0;}.card{background:#18202a;border:1px solid #38506a;border-radius:8px;padding:12px;}.card .label{font-size:13px;color:#9fb3c8;}.card .value{font-size:26px;color:#8cc8ff;font-weight:bold;margin-top:4px;}.card .sub{font-size:12px;color:#9fb3c8;margin-top:2px;}"
 ".row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row>*{flex:1}.small{font-size:14px;color:#b8c4cf}.dpad{display:grid;grid-template-columns:76px 76px 76px;grid-template-rows:76px 76px 76px;gap:8px;justify-content:center;touch-action:none}.blank{width:76px;height:76px;}"
 "input[type=range]{width:100%;}pre{white-space:pre-wrap;background:#1e2329;padding:10px;border-radius:8px;font-size:12px;}"
 "#summary{font-size:17px;line-height:1.45;}#summary b{font-size:24px;color:#8cc8ff;} .warn{color:#ffd166;}"
@@ -978,6 +1134,7 @@ static const char s_index_html[] =
 "<h2>Follow / Remote</h2>"
 "<button id='stop' onclick='estop()'>STOP</button><br>"
 "<button id='arm' onclick='arm()'>CLEAR / ARM</button><button id='off' onclick='motionOff()'>MOTION OFF</button>"
+"<div class='cards'><div class='card'><div class='label'>Battery</div><div class='value' id='batVal'>--%</div><div class='sub' id='batSub'>-- V</div></div><div class='card'><div class='label'>Weight</div><div class='value' id='weightVal'>15.2 kg</div></div></div>"
 "<div class='panel'><div class='row'><button id='mf' onclick=\"setMode('follow')\">跟随模式</button><button id='mr' onclick=\"setMode('remote')\">遥控模式</button></div>"
 "<div class='small'>Follow speed <span id='fsv'>--</span>%</div><input id='fs' type='range' min='0' max='100' value='75' oninput='tuneNow()' onchange='tuneNow(true)'>"
 "<div class='small'>Follow turn <span id='ftv'>--</span>%</div><input id='ft' type='range' min='0' max='100' value='65' oninput='tuneNow()' onchange='tuneNow(true)'>"
@@ -991,12 +1148,13 @@ static const char s_index_html[] =
 "<script>"
 "function f(x,d){return (x===undefined||x===null||!isFinite(Number(x)))?'--':Number(x).toFixed(d);}"
 "let tuneTimer=null,tuneHoldUntil=0,seq=1,lastMode='follow',holdX=0,holdY=0,holdD=false;"
-"function render(j){let r=j.remote||{},t=j.target||{},u=j.uwb||{},c=j.control||{},m=j.mode||{};"
+"function render(j){let r=j.remote||{},t=j.target||{},u=j.uwb||{},c=j.control||{},m=j.mode||{},a=j.analog||{};"
 "document.getElementById('errmsg').textContent='';"
 "lastMode=m.name||'follow';document.getElementById('mf').className=lastMode==='follow'?'active':'';document.getElementById('mr').className=lastMode==='remote'?'active':'';"
 "document.getElementById('remotePanel').style.display=lastMode==='remote'?'block':'none';"
 "if(Date.now()>tuneHoldUntil&&['fs','ft','ms'].indexOf(document.activeElement&&document.activeElement.id)<0){['fs','ft','ms'].forEach(function(id){let k=id==='fs'?'follow_speed_pct':id==='ft'?'follow_turn_pct':'remote_speed_pct';if(m[k]!==undefined)document.getElementById(id).value=m[k];});}"
 "document.getElementById('fsv').textContent=document.getElementById('fs').value;document.getElementById('ftv').textContent=document.getElementById('ft').value;document.getElementById('msv').textContent=document.getElementById('ms').value;"
+"document.getElementById('batVal').textContent=f(a.battery_pct,0)+'%';document.getElementById('batSub').textContent=f(a.battery_voltage_v,2)+' V';document.getElementById('weightVal').textContent=f(a.weight_kg,1)+' kg';"
 "document.getElementById('summary').innerHTML="
 "'<b>'+lastMode.toUpperCase()+'</b> &nbsp; Distance '+f(t.distance_m,2)+' m &nbsp; Bearing '+f(t.bearing_deg,1)+' deg<br>' +"
 "'UWB filtered: d='+f(u.filtered_distance_m,2)+' m, bearing='+f(u.bearing_deg,1)+' deg; raw: d='+f(u.raw_distance_m,2)+' m, bearing='+f(u.raw_bearing_deg,1)+' deg<br>' +"
@@ -1141,12 +1299,18 @@ static esp_err_t live_handler(httpd_req_t *req)
     /* Snapshot both data sources quickly, then release locks before formatting. */
     telemetry_record_t rec;
     remote_state_t r;
+    analog_status_t a;
     live_get(&rec);
     remote_get_snapshot(&r);
+    analog_get_snapshot(&a);
 
     uint32_t hb_age_ms = 0xffffffffu;
     if (r.last_heartbeat_us != 0 && t >= r.last_heartbeat_us) {
         hb_age_ms = (uint32_t)((t - r.last_heartbeat_us) / 1000ULL);
+    }
+    uint32_t analog_age_ms = 0xffffffffu;
+    if (a.ts_us != 0 && t >= a.ts_us) {
+        analog_age_ms = (uint32_t)((t - a.ts_us) / 1000ULL);
     }
 
     /* Stack-allocated buffer avoids the race where two concurrent requests
@@ -1188,6 +1352,11 @@ static esp_err_t live_handler(httpd_req_t *req)
              "\"direct_left_us\":%d,\"direct_right_us\":%d,"
              "\"chassis_update_ret\":%d,\"chassis_pulse_ret\":%d,"
              "\"meas_v_mps\":%.3f,\"meas_w_rps\":%.3f},"
+             "\"analog\":{\"valid\":%s,\"age_ms\":%lu,"
+             "\"battery_gpio\":3,\"battery_raw\":%d,\"battery_mv\":%d,"
+             "\"battery_voltage_v\":%.2f,\"battery_pct\":%.1f,"
+             "\"pressure_gpio\":8,\"pressure_raw\":%d,\"pressure_mv\":%d,"
+             "\"pressure_voltage_v\":%.3f,\"weight_kg\":%.2f},"
              "\"log\":{\"dropped\":%lu,\"path\":\"%s\"}"
              "}\n",
              r.client_connected ? "true" : "false",
@@ -1268,6 +1437,16 @@ static esp_err_t live_handler(httpd_req_t *req)
              rec.chassis_pulse_ret,
              rec.meas_v_mps,
              rec.meas_w_rps,
+             a.valid ? "true" : "false",
+             (unsigned long)analog_age_ms,
+             a.battery_raw,
+             a.battery_mv,
+             a.battery_voltage_v,
+             a.battery_pct,
+             a.pressure_raw,
+             a.pressure_mv,
+             a.pressure_voltage_v,
+             a.weight_kg,
              (unsigned long)s_log_dropped,
              FR_LOG_PATH);
 
@@ -1883,6 +2062,7 @@ void app_main(void)
     }
 
     imu_bringup();
+    xTaskCreate(analog_task, "analog", 4096, NULL, 4, NULL);
 
     /* 3. 默认 motion_armed=false / estop_latched=true；CLEAR / ARM 后保持 true，STOP 后 false。
      * 调试时可设 FR_STARTUP_AUTO_ARM=1 跳过手动解锁步骤，但正常使用时务必保持为 0。 */
