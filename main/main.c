@@ -334,6 +334,8 @@ void app_main(void)
 
     print_help();
     print_status();
+    printf("\n> ");
+    fflush(stdout);
 
     uint8_t ch = 0;
 
@@ -344,6 +346,8 @@ void app_main(void)
             if (ch == '\r' || ch == '\n') {
                 continue;
             }
+
+            printf("\rKEY: %c (0x%02X)\n", ch, (unsigned)ch);
 
             if (ch == 'w' || ch == 'W') {
                 motor_forward();
@@ -418,6 +422,9 @@ void app_main(void)
                 printf("Unknown command: %c\n", ch);
                 printf("Press h for help.\n");
             }
+
+            printf("> ");
+            fflush(stdout);
         }
 
     }
