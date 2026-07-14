@@ -1,4 +1,4 @@
-# 7.13
+# Follow 2026-07-13
 
 这是 2026-07-13 晚调试并烧录验证的算法 6.2 跟随行李箱代码。
 
@@ -17,7 +17,7 @@
 热点名称：`Algorithm6-Control`，无密码。连接后访问 `http://192.168.4.1`。
 
 ```powershell
-cd C:\path\to\7.13
+cd C:\path\to\follow-2026-07-13
 D:\1Download\Espressif\frameworks\esp-idf-v5.4.3\export.ps1
 idf.py build
 idf.py -p COM10 flash monitor
