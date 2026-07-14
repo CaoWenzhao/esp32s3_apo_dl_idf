@@ -1,11 +1,13 @@
 #include <stdio.h>
 #include <inttypes.h>
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "driver/uart.h"
 #include "driver/usb_serial_jtag.h"
 
 #include "esp_err.h"
@@ -58,6 +60,8 @@ static int speed_delta_us = DEFAULT_SPEED_DELTA_US;
 
 static int last_left_pulse = ESC_MID_US;
 static int last_right_pulse = ESC_MID_US;
+static bool uart_input_ready = false;
+static bool usb_input_ready = false;
 
 // 四倍频正交编码器查表
 static const int8_t quad_table[16] = {
@@ -266,12 +270,46 @@ static void encoder_init(void)
 
 static void command_input_init(void)
 {
+    if (!uart_is_driver_installed(UART_NUM_0)) {
+        uart_config_t uart_config = {
+            .baud_rate = 115200,
+            .data_bits = UART_DATA_8_BITS,
+            .parity = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+            .source_clk = UART_SCLK_DEFAULT,
+        };
+        ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &uart_config));
+        ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE,
+                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                                     UART_PIN_NO_CHANGE));
+        ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0));
+    }
+    uart_input_ready = true;
+
     usb_serial_jtag_driver_config_t usb_serial_jtag_config = {
         .tx_buffer_size = 1024,
         .rx_buffer_size = 1024,
     };
 
-    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_serial_jtag_config));
+    if (!usb_serial_jtag_is_driver_installed()) {
+        ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_serial_jtag_config));
+    }
+    usb_input_ready = true;
+}
+
+static int read_command_byte(uint8_t *ch)
+{
+    if (uart_input_ready &&
+        uart_read_bytes(UART_NUM_0, ch, 1, 0) == 1) {
+        return 1;
+    }
+    if (usb_input_ready &&
+        usb_serial_jtag_read_bytes(ch, 1, 0) == 1) {
+        return 1;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return 0;
 }
 
 // ===================== 状态显示 =====================
@@ -327,6 +365,7 @@ void app_main(void)
     printf("GPIO5 -> APO-DL B channel S\n");
     printf("GND   -> APO-DL A/B channel -\n");
     printf("APO-DL A/B channel + not connected\n");
+    printf("Keyboard input: UART0 + USB Serial/JTAG\n");
     printf("========================================\n\n");
 
     printf("Output 1500us stop now.\n");
@@ -340,7 +379,7 @@ void app_main(void)
     uint8_t ch = 0;
 
     while (1) {
-        int len = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(20));
+        int len = read_command_byte(&ch);
 
         if (len > 0) {
             if (ch == '\r' || ch == '\n') {

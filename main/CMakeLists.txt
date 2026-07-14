@@ -4,5 +4,6 @@ idf_component_register(
     REQUIRES
         esp_driver_gpio
         esp_driver_ledc
+        esp_driver_uart
         esp_driver_usb_serial_jtag
 )
