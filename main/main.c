@@ -39,14 +39,12 @@
 #define LEDC_DUTY_RES        LEDC_TIMER_14_BIT
 #define LEDC_DUTY_MAX        ((1 << 14) - 1)
 
-// 初始速度力度：1500 ± 300，也就是前进 1800，后退 1200
-// 觉得太慢就按 +，太快就按 -
-#define DEFAULT_SPEED_DELTA_US   300
-#define MIN_SPEED_DELTA_US       100
+// Start at the full ESC range. Use '-' to reduce the test output.
+#define DEFAULT_SPEED_DELTA_US   500
+#define MIN_SPEED_DELTA_US       50
 #define MAX_SPEED_DELTA_US       500
-
-// 收到一次 w/s/a/d 后，最多运行多久，然后自动停止
-#define COMMAND_TIMEOUT_MS       1200
+#define SPEED_STEP_US            25
+#define ESC_ARM_DELAY_MS         3000
 
 // ===================== 全局变量 =====================
 
@@ -182,6 +180,18 @@ static void motor_turn_right(void)
     set_right_pulse(ESC_MID_US - speed_delta_us);
 }
 
+static void motor_left_only(int direction)
+{
+    set_left_pulse(ESC_MID_US + direction * speed_delta_us);
+    set_right_pulse(ESC_MID_US);
+}
+
+static void motor_right_only(int direction)
+{
+    set_left_pulse(ESC_MID_US);
+    set_right_pulse(ESC_MID_US + direction * speed_delta_us);
+}
+
 // ===================== 初始化 =====================
 
 static void esc_init(void)
@@ -284,6 +294,10 @@ static void print_help(void)
     printf("  a = turn left\n");
     printf("  d = turn right\n");
     printf("  x = stop\n");
+    printf("  1 = left motor forward only\n");
+    printf("  2 = left motor backward only\n");
+    printf("  3 = right motor forward only\n");
+    printf("  4 = right motor backward only\n");
     printf("  c = show encoder count\n");
     printf("  z = show status\n");
     printf("  + = increase speed\n");
@@ -302,6 +316,10 @@ void app_main(void)
     command_input_init();
     encoder_init();
 
+    printf("Holding 1500us neutral for ESC arming (%d ms)...\n",
+           ESC_ARM_DELAY_MS);
+    vTaskDelay(pdMS_TO_TICKS(ESC_ARM_DELAY_MS));
+
     printf("\n========================================\n");
     printf("ESP32-S3 + APO-DL COMMAND CONTROL\n");
     printf("RC mode: 50Hz, 1000-2000us, 1500us stop\n");
@@ -318,8 +336,6 @@ void app_main(void)
     print_status();
 
     uint8_t ch = 0;
-    int motor_running = 0;
-    int timeout_count = 0;
 
     while (1) {
         int len = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(20));
@@ -329,37 +345,49 @@ void app_main(void)
                 continue;
             }
 
-            timeout_count = 0;
-
             if (ch == 'w' || ch == 'W') {
                 motor_forward();
-                motor_running = 1;
                 printf("CMD: FORWARD | pulse L/R: %dus / %dus\n",
                        last_left_pulse, last_right_pulse);
 
             } else if (ch == 's' || ch == 'S') {
                 motor_backward();
-                motor_running = 1;
                 printf("CMD: BACKWARD | pulse L/R: %dus / %dus\n",
                        last_left_pulse, last_right_pulse);
 
             } else if (ch == 'a' || ch == 'A') {
                 motor_turn_left();
-                motor_running = 1;
                 printf("CMD: TURN LEFT | pulse L/R: %dus / %dus\n",
                        last_left_pulse, last_right_pulse);
 
             } else if (ch == 'd' || ch == 'D') {
                 motor_turn_right();
-                motor_running = 1;
                 printf("CMD: TURN RIGHT | pulse L/R: %dus / %dus\n",
                        last_left_pulse, last_right_pulse);
 
             } else if (ch == 'x' || ch == 'X') {
                 motor_stop();
-                motor_running = 0;
-                timeout_count = 0;
                 printf("CMD: STOP | pulse L/R: %dus / %dus\n",
+                       last_left_pulse, last_right_pulse);
+
+            } else if (ch == '1') {
+                motor_left_only(1);
+                printf("CMD: LEFT ONLY FORWARD | pulse L/R: %dus / %dus\n",
+                       last_left_pulse, last_right_pulse);
+
+            } else if (ch == '2') {
+                motor_left_only(-1);
+                printf("CMD: LEFT ONLY BACKWARD | pulse L/R: %dus / %dus\n",
+                       last_left_pulse, last_right_pulse);
+
+            } else if (ch == '3') {
+                motor_right_only(1);
+                printf("CMD: RIGHT ONLY FORWARD | pulse L/R: %dus / %dus\n",
+                       last_left_pulse, last_right_pulse);
+
+            } else if (ch == '4') {
+                motor_right_only(-1);
+                printf("CMD: RIGHT ONLY BACKWARD | pulse L/R: %dus / %dus\n",
                        last_left_pulse, last_right_pulse);
 
             } else if (ch == 'c' || ch == 'C') {
@@ -370,14 +398,14 @@ void app_main(void)
                 print_status();
 
             } else if (ch == '+') {
-                speed_delta_us += 50;
+                speed_delta_us += SPEED_STEP_US;
                 speed_delta_us = clamp_int(speed_delta_us,
                                            MIN_SPEED_DELTA_US,
                                            MAX_SPEED_DELTA_US);
                 printf("Speed increased: speed_delta_us = %d\n", speed_delta_us);
 
             } else if (ch == '-') {
-                speed_delta_us -= 50;
+                speed_delta_us -= SPEED_STEP_US;
                 speed_delta_us = clamp_int(speed_delta_us,
                                            MIN_SPEED_DELTA_US,
                                            MAX_SPEED_DELTA_US);
@@ -392,16 +420,5 @@ void app_main(void)
             }
         }
 
-        if (motor_running) {
-            timeout_count += 20;
-
-            if (timeout_count >= COMMAND_TIMEOUT_MS) {
-                motor_stop();
-                motor_running = 0;
-                timeout_count = 0;
-                printf("TIMEOUT STOP | pulse L/R: %dus / %dus\n",
-                       last_left_pulse, last_right_pulse);
-            }
-        }
     }
 }
