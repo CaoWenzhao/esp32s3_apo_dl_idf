@@ -1,7 +1,0 @@
-build/
-**/build/
-sdkconfig
-sdkconfig.old
-managed_components/
-work/test-build/
-work/github/

@@ -2,7 +2,15 @@ idf_component_register(
     SRCS "main.c"
     INCLUDE_DIRS "."
     REQUIRES
-        esp_driver_gpio
+        a02yyuw
+        board
+        bu_uwb
+        fsr_adc
+        rplidar_c1
+        chassis
+        follow_avoid
+        web_control
+        esp_timer
         esp_driver_ledc
-        esp_driver_usb_serial_jtag
+        esp_driver_gpio
 )
