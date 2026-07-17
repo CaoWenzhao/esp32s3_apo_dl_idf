@@ -1,4 +1,4 @@
-/* Algorithm 6: UWB-directed, encoder-closed-loop follow vehicle without IMU. */
+/* UWB follow vehicle with lidar avoidance and web/manual control. */
 
 #include <math.h>
 #include <stdbool.h>
@@ -28,33 +28,47 @@ static const char *TAG = "algorithm6";
 #define PI_F 3.14159265358979323846f
 #define DEG_TO_RAD(value) ((value) * PI_F / 180.0f)
 #define LIDAR_SECTORS 48
-#define LIDAR_FOV_RAD DEG_TO_RAD(240.0f)
+#define LIDAR_FOV_RAD DEG_TO_RAD(130.0f)
 #define LIDAR_FRONT_MAX_DEG 65.0f
 #define LIDAR_FRONT_MIN_DEG 295.0f
-#define ULTRA_LEFT_LO_DEG 60.0f
-#define ULTRA_LEFT_HI_DEG 120.0f
-#define ULTRA_RIGHT_LO_DEG -120.0f
-#define ULTRA_RIGHT_HI_DEG -60.0f
 #define TARGET_FRESH_US 700000ULL
 #define FIELD_FRESH_US 500000ULL
-#define ULTRA_FRESH_US 500000ULL
+#define ULTRA_FRESH_US 800000ULL
 #define FSR_FRESH_US 500000ULL
+#define BATTERY_FRESH_US 500000ULL
+#define UWB_SMOOTH_TAU_S 0.08f
+#define UWB_MAX_TARGET_SPEED_MPS 8.0f
+#define UWB_JUMP_MARGIN_M 0.55f
+#define UWB_REINIT_OUTLIERS 2
+#define SUITCASE_BASE_WEIGHT_KG 10.2f
+#define PRESSURE_ZERO_RAW_THRESHOLD 24
+#define PRESSURE_KG_PER_VOLT 10.0f
+#define LIDAR_TELEMETRY_MAX_M 12.0f
+#define LIDAR_MOTOR_RPM 600
 
 typedef struct {
     SemaphoreHandle_t lock;
     float target_distance_m;
     float target_bearing_rad;
+    float target_bearing_rate_rps;
     uint64_t target_timestamp_us;
     fa_obstacle_field_t field;
     uint64_t field_timestamp_us;
     float ultrasonic_left_m;
     uint64_t ultrasonic_left_timestamp_us;
+    uint32_t ultrasonic_left_frames;
     float ultrasonic_right_m;
     uint64_t ultrasonic_right_timestamp_us;
+    uint32_t ultrasonic_right_frames;
     float fsr_voltage_v;
     float fsr_weight_kg;
     int fsr_raw;
     uint64_t fsr_timestamp_us;
+    float battery_voltage_v;
+    float battery_percent;
+    float battery_adc_voltage_v;
+    int battery_raw;
+    uint64_t battery_timestamp_us;
 } sensor_snapshot_t;
 
 typedef struct {
@@ -98,38 +112,83 @@ static bool is_fresh(uint64_t current_us, uint64_t timestamp_us,
            current_us - timestamp_us < maximum_age_us;
 }
 
+static float clampf_local(float value, float minimum, float maximum)
+{
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+}
+
 static void uwb_task(void *argument)
 {
     (void)argument;
     char line[BU_UWB_LINE_MAX];
+    bool filter_initialized = false;
+    float filtered_forward_m = 0.0f;
+    float filtered_left_m = 0.0f;
+    float filtered_bearing_rad = 0.0f;
+    uint64_t accepted_timestamp_us = 0;
+    unsigned consecutive_outliers = 0;
     while (true) {
         esp_err_t ret = bu_uwb_read_line(line, sizeof(line), 200);
         if (ret != ESP_OK) {
             continue;
         }
         bu_uwb_twr_reading_t twr = {0};
-        bu_uwb_distance_t distance = {0};
-        if (bu_uwb_parse_twr_line(line, &twr) && twr.valid) {
-            const float forward_m = (float)twr.y_cm / 100.0f;
-            const float left_m = (float)twr.x_cm / 100.0f;
-            const float range_m = twr.distance_cm > 0
-                                      ? (float)twr.distance_cm / 100.0f
-                                      : sqrtf(forward_m * forward_m + left_m * left_m);
-            const float bearing_rad =
-                fabsf(forward_m) > 0.001f || fabsf(left_m) > 0.001f
-                    ? atan2f(left_m, forward_m)
-                    : 0.0f;
-            sensors_lock();
-            s_sensors.target_distance_m = range_m;
-            s_sensors.target_bearing_rad = bearing_rad;
-            s_sensors.target_timestamp_us = now_us();
-            sensors_unlock();
-        } else if (bu_uwb_parse_distance_line(line, &distance) && distance.valid) {
-            sensors_lock();
-            s_sensors.target_distance_m = distance.distance_m;
-            s_sensors.target_timestamp_us = now_us();
-            sensors_unlock();
+        if (!bu_uwb_parse_twr_line(line, &twr) || !twr.valid) {
+            continue;
         }
+
+        const uint64_t timestamp_us = now_us();
+        const float forward_m = (float)twr.y_cm / 100.0f;
+        const float left_m = (float)twr.x_cm / 100.0f;
+        float dt = 0.0f;
+        if (accepted_timestamp_us != 0 && timestamp_us > accepted_timestamp_us) {
+            dt = (float)(timestamp_us - accepted_timestamp_us) / 1000000.0f;
+        }
+
+        bool reinitialize = !filter_initialized || dt <= 0.0f || dt > 1.5f;
+        if (!reinitialize) {
+            const float jump = hypotf(forward_m - filtered_forward_m,
+                                      left_m - filtered_left_m);
+            const float maximum_jump = UWB_MAX_TARGET_SPEED_MPS * dt +
+                                       UWB_JUMP_MARGIN_M;
+            if (jump > maximum_jump &&
+                consecutive_outliers < UWB_REINIT_OUTLIERS) {
+                consecutive_outliers++;
+                continue;
+            }
+            if (consecutive_outliers >= UWB_REINIT_OUTLIERS) {
+                reinitialize = true;
+            }
+        }
+
+        const float previous_bearing = filtered_bearing_rad;
+        if (reinitialize) {
+            filtered_forward_m = forward_m;
+            filtered_left_m = left_m;
+        } else {
+            const float alpha = clampf_local(dt / (UWB_SMOOTH_TAU_S + dt),
+                                             0.25f, 0.95f);
+            filtered_forward_m += alpha * (forward_m - filtered_forward_m);
+            filtered_left_m += alpha * (left_m - filtered_left_m);
+        }
+        filtered_bearing_rad = atan2f(filtered_left_m, filtered_forward_m);
+        const float bearing_rate_rps = filter_initialized && dt > 0.001f
+                                           ? fa_wrap_pi(filtered_bearing_rad -
+                                                        previous_bearing) / dt
+                                           : 0.0f;
+        filter_initialized = true;
+        consecutive_outliers = 0;
+        accepted_timestamp_us = timestamp_us;
+
+        sensors_lock();
+        s_sensors.target_distance_m = hypotf(filtered_forward_m,
+                                              filtered_left_m);
+        s_sensors.target_bearing_rad = filtered_bearing_rad;
+        s_sensors.target_bearing_rate_rps = bearing_rate_rps;
+        s_sensors.target_timestamp_us = timestamp_us;
+        sensors_unlock();
     }
 }
 
@@ -190,19 +249,24 @@ static void ultrasonic_task(void *argument)
     ultrasonic_task_arg_t *task = (ultrasonic_task_arg_t *)argument;
     while (true) {
         a02yyuw_reading_t reading = {0};
-        esp_err_t ret = a02yyuw_read_dev(task->device, &reading, 120);
+        esp_err_t ret = a02yyuw_read_dev(task->device, &reading, 0);
         if (ret == ESP_OK && reading.valid) {
+            const uint64_t timestamp_us = now_us();
             sensors_lock();
             if (task->left) {
-                s_sensors.ultrasonic_left_m = (float)reading.distance_mm / 1000.0f;
-                s_sensors.ultrasonic_left_timestamp_us = now_us();
+                s_sensors.ultrasonic_left_m =
+                    (float)reading.distance_mm / 1000.0f;
+                s_sensors.ultrasonic_left_timestamp_us = timestamp_us;
+                s_sensors.ultrasonic_left_frames++;
             } else {
-                s_sensors.ultrasonic_right_m = (float)reading.distance_mm / 1000.0f;
-                s_sensors.ultrasonic_right_timestamp_us = now_us();
+                s_sensors.ultrasonic_right_m =
+                    (float)reading.distance_mm / 1000.0f;
+                s_sensors.ultrasonic_right_timestamp_us = timestamp_us;
+                s_sensors.ultrasonic_right_frames++;
             }
             sensors_unlock();
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -211,36 +275,41 @@ static void fsr_task(void *argument)
     (void)argument;
     while (true) {
         fsr_adc_reading_t reading = {0};
-        esp_err_t ret = fsr_adc_read(&reading);
-        if (ret == ESP_OK && reading.valid) {
+        battery_adc_reading_t battery = {0};
+        esp_err_t fsr_ret = fsr_adc_read(&reading);
+        esp_err_t battery_ret = battery_adc_read(&battery);
+        if ((fsr_ret == ESP_OK && reading.valid) ||
+            (battery_ret == ESP_OK && battery.valid)) {
             sensors_lock();
-            s_sensors.fsr_raw = reading.raw;
-            s_sensors.fsr_voltage_v = reading.voltage_v;
-            s_sensors.fsr_weight_kg = reading.weight_kg;
-            s_sensors.fsr_timestamp_us = now_us();
+            const uint64_t timestamp_us = now_us();
+            if (fsr_ret == ESP_OK && reading.valid) {
+                s_sensors.fsr_raw = reading.raw;
+                s_sensors.fsr_voltage_v = reading.voltage_v;
+                const float extra_weight_kg =
+                    reading.raw <= PRESSURE_ZERO_RAW_THRESHOLD
+                        ? 0.0f
+                        : reading.voltage_v * PRESSURE_KG_PER_VOLT;
+                s_sensors.fsr_weight_kg = SUITCASE_BASE_WEIGHT_KG +
+                                          extra_weight_kg;
+                s_sensors.fsr_timestamp_us = timestamp_us;
+            }
+            if (battery_ret == ESP_OK && battery.valid) {
+                s_sensors.battery_raw = battery.raw;
+                s_sensors.battery_adc_voltage_v = battery.adc_voltage_v;
+                s_sensors.battery_voltage_v = battery.battery_voltage_v;
+                s_sensors.battery_percent = battery.percent;
+                s_sensors.battery_timestamp_us = timestamp_us;
+            }
             sensors_unlock();
-        } else if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "FSR read failed: %s", esp_err_to_name(ret));
+        } else {
+            if (fsr_ret != ESP_OK) {
+                ESP_LOGW(TAG, "FSR read failed: %s", esp_err_to_name(fsr_ret));
+            }
+            if (battery_ret != ESP_OK) {
+                ESP_LOGW(TAG, "battery read failed: %s", esp_err_to_name(battery_ret));
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-
-static void inject_ultrasonic(fa_obstacle_field_t *field, float low_degrees,
-                              float high_degrees, float distance_m)
-{
-    if (field == NULL || distance_m <= 0.0f) {
-        return;
-    }
-    const float low = DEG_TO_RAD(low_degrees);
-    const float high = DEG_TO_RAD(high_degrees);
-    const float half = 0.5f * field->fov_rad;
-    for (int index = 0; index < field->num_sectors; ++index) {
-        const float angle = -half + ((float)index + 0.5f) * field->sector_width_rad;
-        if (angle >= low && angle <= high &&
-            distance_m < field->min_dist_m[index]) {
-            field->min_dist_m[index] = distance_m;
-        }
     }
 }
 
@@ -256,6 +325,50 @@ static fa_config_t follow_config(void)
     config.safe_distance_m = CONFIG_FOLLOW_ROBOT_SAFE_DIST_MM / 1000.0f;
     config.robot_half_width_m = CONFIG_FOLLOW_ROBOT_ROBOT_HALF_WIDTH_MM / 1000.0f;
     return config;
+}
+
+static int wheel_speed_to_pulse_us(float wheel_mps, const chassis_config_t *cfg,
+                                   bool invert)
+{
+    if (invert) wheel_mps = -wheel_mps;
+    wheel_mps = clampf_local(wheel_mps, -cfg->max_speed_mps,
+                             cfg->max_speed_mps);
+    float pulse = (float)cfg->esc_mid_us;
+    if (wheel_mps >= 0.0f) {
+        pulse += wheel_mps / cfg->max_speed_mps *
+                 (float)(cfg->esc_max_us - cfg->esc_mid_us);
+    } else {
+        pulse += wheel_mps / cfg->max_speed_mps *
+                 (float)(cfg->esc_mid_us - cfg->esc_min_us);
+    }
+    return (int)lroundf(clampf_local(pulse, (float)cfg->esc_min_us,
+                                     (float)cfg->esc_max_us));
+}
+
+static esp_err_t set_direct_velocity(chassis_t *chassis, float v_mps,
+                                     float omega_rps)
+{
+    const chassis_config_t *cfg = &chassis->cfg;
+    const float half_track = 0.5f * cfg->track_width_m;
+    float left_mps = v_mps - omega_rps * half_track;
+    float right_mps = v_mps + omega_rps * half_track;
+    const float peak = fmaxf(fabsf(left_mps), fabsf(right_mps));
+    if (peak > cfg->max_speed_mps && peak > 0.0f) {
+        const float scale = cfg->max_speed_mps / peak;
+        left_mps *= scale;
+        right_mps *= scale;
+    }
+    return chassis_set_pulse_us(
+        chassis,
+        wheel_speed_to_pulse_us(left_mps, cfg, cfg->left_invert),
+        wheel_speed_to_pulse_us(right_mps, cfg, cfg->right_invert));
+}
+
+static float telemetry_clearance(float distance_m)
+{
+    return distance_m >= FA_NO_OBSTACLE * 0.5f
+               ? LIDAR_TELEMETRY_MAX_M
+               : clampf_local(distance_m, 0.0f, LIDAR_TELEMETRY_MAX_M);
 }
 
 static chassis_config_t chassis_config(void)
@@ -326,51 +439,63 @@ static void control_task(void *argument)
         fa_obstacle_field_t field;
         fa_range_t ultrasonic_left = {0};
         fa_range_t ultrasonic_right = {0};
+        uint32_t ultrasonic_left_frames;
+        uint32_t ultrasonic_right_frames;
         float fsr_voltage_v;
         float fsr_weight_kg;
         int fsr_raw;
         uint64_t fsr_timestamp_us;
-        uint64_t ultrasonic_left_timestamp_us;
-        uint64_t ultrasonic_right_timestamp_us;
+        float battery_voltage_v;
+        float battery_percent;
+        float battery_adc_voltage_v;
+        int battery_raw;
+        uint64_t battery_timestamp_us;
         sensors_lock();
         target.valid = is_fresh(current_us, s_sensors.target_timestamp_us,
                                 TARGET_FRESH_US);
         target.distance_m = s_sensors.target_distance_m;
         target.bearing_rad = s_sensors.target_bearing_rad;
+        target.bearing_rate_rps = s_sensors.target_bearing_rate_rps;
         const bool have_field = is_fresh(current_us, s_sensors.field_timestamp_us,
                                          FIELD_FRESH_US);
         field = s_sensors.field;
         ultrasonic_left.valid = is_fresh(
             current_us, s_sensors.ultrasonic_left_timestamp_us, ULTRA_FRESH_US);
         ultrasonic_left.dist_m = s_sensors.ultrasonic_left_m;
-        ultrasonic_left_timestamp_us = s_sensors.ultrasonic_left_timestamp_us;
         ultrasonic_right.valid = is_fresh(
             current_us, s_sensors.ultrasonic_right_timestamp_us, ULTRA_FRESH_US);
         ultrasonic_right.dist_m = s_sensors.ultrasonic_right_m;
-        ultrasonic_right_timestamp_us = s_sensors.ultrasonic_right_timestamp_us;
+        ultrasonic_left_frames = s_sensors.ultrasonic_left_frames;
+        ultrasonic_right_frames = s_sensors.ultrasonic_right_frames;
         fsr_voltage_v = s_sensors.fsr_voltage_v;
         fsr_weight_kg = s_sensors.fsr_weight_kg;
         fsr_raw = s_sensors.fsr_raw;
         fsr_timestamp_us = s_sensors.fsr_timestamp_us;
+        battery_voltage_v = s_sensors.battery_voltage_v;
+        battery_percent = s_sensors.battery_percent;
+        battery_adc_voltage_v = s_sensors.battery_adc_voltage_v;
+        battery_raw = s_sensors.battery_raw;
+        battery_timestamp_us = s_sensors.battery_timestamp_us;
         sensors_unlock();
 
+        float lidar_front_m = 0.0f;
         if (have_field) {
-            if (ultrasonic_left.valid) {
-                inject_ultrasonic(&field, ULTRA_LEFT_LO_DEG, ULTRA_LEFT_HI_DEG,
-                                  ultrasonic_left.dist_m);
-                ultrasonic_left.valid = false;
-            }
-            if (ultrasonic_right.valid) {
-                inject_ultrasonic(&field, ULTRA_RIGHT_LO_DEG, ULTRA_RIGHT_HI_DEG,
-                                  ultrasonic_right.dist_m);
-                ultrasonic_right.valid = false;
-            }
+            lidar_front_m = telemetry_clearance(fa_obstacle_clearance(
+                &field, -follow.cfg.front_cone_rad, follow.cfg.front_cone_rad));
         }
+        const float combined_front_m = have_field ? lidar_front_m : 0.0f;
+        const float combined_left_m = ultrasonic_left.valid
+                                          ? ultrasonic_left.dist_m
+                                          : 0.0f;
+        const float combined_right_m = ultrasonic_right.valid
+                                           ? ultrasonic_right.dist_m
+                                           : 0.0f;
 
         web_control_command_t web_command = {0};
         web_control_get_command(&web_command);
         fa_output_t output = {0};
         esp_err_t command_ret;
+        bool direct_follow_control = false;
         const char *state_name;
         if (web_command.estop_latched || !web_command.client_alive) {
             command_ret = chassis_emergency_stop(chassis);
@@ -385,11 +510,14 @@ static void control_task(void *argument)
                                &ultrasonic_left, &ultrasonic_right, dt);
             output.v_mps *= (float)web_command.follow_speed_pct / 100.0f;
             output.omega_rps *= (float)web_command.follow_turn_pct / 100.0f;
-            command_ret = chassis_set_velocity(chassis, output.v_mps,
-                                               output.omega_rps);
+            command_ret = set_direct_velocity(chassis, output.v_mps,
+                                              output.omega_rps);
+            direct_follow_control = true;
             state_name = follow_state_name(output.state);
         }
-        esp_err_t update_ret = chassis_update(chassis, dt);
+        esp_err_t update_ret = direct_follow_control
+                                   ? ESP_OK
+                                   : chassis_update(chassis, dt);
         if (command_ret != ESP_OK || update_ret != ESP_OK) {
             esp_err_t stop_ret = chassis_emergency_stop(chassis);
             ESP_LOGE(TAG, "chassis command=%s update=%s emergency=%s",
@@ -405,22 +533,25 @@ static void control_task(void *argument)
             .state = state_name,
             .uwb_ok = target.valid,
             .lidar_ok = have_field,
-            .ultrasonic_left_ok = ultrasonic_left.valid ||
-                                  is_fresh(current_us,
-                                           ultrasonic_left_timestamp_us,
-                                           ULTRA_FRESH_US),
-            .ultrasonic_right_ok = ultrasonic_right.valid ||
-                                   is_fresh(current_us,
-                                            ultrasonic_right_timestamp_us,
-                                            ULTRA_FRESH_US),
+            .ultrasonic_left_ok = ultrasonic_left.valid,
+            .ultrasonic_right_ok = ultrasonic_right.valid,
             .fsr_ok = is_fresh(current_us, fsr_timestamp_us, FSR_FRESH_US),
+            .battery_ok = is_fresh(current_us, battery_timestamp_us,
+                                   BATTERY_FRESH_US),
             .encoder_ok = !chassis_encoder_faulted(chassis),
             .target_distance_m = target.distance_m,
             .target_bearing_rad = target.bearing_rad,
-            .front_clearance_m = output.front_clearance_m,
+            .front_clearance_m = combined_front_m,
+            .left_clearance_m = combined_left_m,
+            .right_clearance_m = combined_right_m,
+            .chosen_heading_rad = output.chosen_heading_rad,
             .fsr_voltage_v = fsr_voltage_v,
             .fsr_weight_kg = fsr_weight_kg,
             .fsr_raw = fsr_raw,
+            .battery_voltage_v = battery_voltage_v,
+            .battery_percent = battery_percent,
+            .battery_adc_voltage_v = battery_adc_voltage_v,
+            .battery_raw = battery_raw,
             .measured_linear_mps = measured_v,
             .measured_angular_rps = measured_w,
             .left_pulse_us = (int)chassis->cmd_pulse_l_us,
@@ -430,10 +561,21 @@ static void control_task(void *argument)
 
         if (++log_counter >= (unsigned)CONFIG_FOLLOW_ROBOT_CONTROL_HZ) {
             log_counter = 0;
-            ESP_LOGI(TAG, "%s target=%d d=%.2f bearing=%+.2f v=%+.2f w=%+.2f pulses=%d/%d",
+            ESP_LOGI(TAG, "%s target=%d d=%.2f bearing=%+.2f cmd=%+.2f/%+.2f pulses=%d/%d | lidar=%d ultra=%d/%d frames=%lu/%lu rmt_evt=%lu/%lu sym=%u/%u bytes=%lu/%lu front=%.2f left=%.2f right=%.2f heading=%+.1fdeg",
                      state_name, target.valid, target.distance_m,
-                     target.bearing_rad, measured_v, measured_w,
-                     telemetry.left_pulse_us, telemetry.right_pulse_us);
+                     target.bearing_rad, output.v_mps, output.omega_rps,
+                     telemetry.left_pulse_us, telemetry.right_pulse_us,
+                     have_field, ultrasonic_left.valid, ultrasonic_right.valid,
+                     (unsigned long)ultrasonic_left_frames,
+                     (unsigned long)ultrasonic_right_frames,
+                     (unsigned long)s_ultrasonic_left.sw_uart.rx_events,
+                     (unsigned long)s_ultrasonic_right.sw_uart.rx_events,
+                     (unsigned)s_ultrasonic_left.sw_uart.last_symbol_count,
+                     (unsigned)s_ultrasonic_right.sw_uart.last_symbol_count,
+                     (unsigned long)s_ultrasonic_left.sw_uart.decoded_bytes,
+                     (unsigned long)s_ultrasonic_right.sw_uart.decoded_bytes,
+                     combined_front_m, combined_left_m, combined_right_m,
+                     output.chosen_heading_rad * 180.0f / PI_F);
         }
     }
 }
@@ -463,7 +605,7 @@ static bool start_task_on_core(TaskFunction_t function, const char *name,
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Algorithm 6 starting: UWB bearing + obstacle correction + encoder PID");
+    ESP_LOGI(TAG, "Follow control starting: filtered UWB + lidar clearance + direct ESC output");
     memset(&s_sensors, 0, sizeof(s_sensors));
     s_sensors.lock = xSemaphoreCreateMutex();
     if (s_sensors.lock == NULL) {
@@ -541,6 +683,15 @@ void app_main(void)
         ESP_LOGW(TAG, "RPLIDAR device info unavailable: %s", esp_err_to_name(ret));
     }
 
+    ret = rplidar_c1_set_motor_speed(&s_lidar, LIDAR_MOTOR_RPM);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "RPLIDAR motor speed set to %d RPM", LIDAR_MOTOR_RPM);
+        vTaskDelay(pdMS_TO_TICKS(300));
+    } else {
+        ESP_LOGW(TAG, "RPLIDAR motor speed command failed: %s",
+                 esp_err_to_name(ret));
+    }
+
     ret = rplidar_c1_start_scan(&s_lidar);
     if (ret == ESP_OK) {
         start_task_on_core(lidar_task, "lidar", 4096, &s_lidar, 6, 1);
@@ -556,8 +707,8 @@ skip_lidar:;
     ultrasonic_left.baudrate = ULTRASONIC_BAUD_RATE;
     ret = a02yyuw_init_dev(&s_ultrasonic_left, &ultrasonic_left);
     if (ret == ESP_OK) {
-        start_task(ultrasonic_task, "ultra_left", 3072,
-                   &s_ultrasonic_left_arg, 5);
+        ESP_LOGI(TAG, "left ultrasonic ready: SW UART RX=GPIO%d baud=%d",
+                 PIN_ULTRASONIC_LEFT_RX, ULTRASONIC_BAUD_RATE);
     } else {
         ESP_LOGE(TAG, "left ultrasonic init failed: %s", esp_err_to_name(ret));
     }
@@ -568,10 +719,24 @@ skip_lidar:;
     ultrasonic_right.baudrate = ULTRASONIC_BAUD_RATE;
     ret = a02yyuw_init_dev(&s_ultrasonic_right, &ultrasonic_right);
     if (ret == ESP_OK) {
-        start_task(ultrasonic_task, "ultra_right", 3072,
-                   &s_ultrasonic_right_arg, 5);
+        ESP_LOGI(TAG, "right ultrasonic ready: SW UART RX=GPIO%d baud=%d",
+                 PIN_ULTRASONIC_RIGHT_RX, ULTRASONIC_BAUD_RATE);
     } else {
         ESP_LOGE(TAG, "right ultrasonic init failed: %s", esp_err_to_name(ret));
+    }
+
+    if (s_ultrasonic_left.initialized && s_ultrasonic_right.initialized) {
+        ESP_LOGI(TAG, "ultrasonic RX: dual parallel RMT capture");
+        start_task(ultrasonic_task, "ultra_left", 3072,
+                   &s_ultrasonic_left_arg, 5);
+        start_task(ultrasonic_task, "ultra_right", 3072,
+                   &s_ultrasonic_right_arg, 5);
+    } else if (s_ultrasonic_left.initialized) {
+        start_task(ultrasonic_task, "ultra_left", 3072,
+                   &s_ultrasonic_left_arg, 5);
+    } else if (s_ultrasonic_right.initialized) {
+        start_task(ultrasonic_task, "ultra_right", 3072,
+                   &s_ultrasonic_right_arg, 5);
     }
 
     fsr_adc_config_t fsr = fsr_config();

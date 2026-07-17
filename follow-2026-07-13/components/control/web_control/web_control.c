@@ -108,10 +108,14 @@ static const char s_index_html[] =
     "<button id='estop' onclick='emergencyStop()'>STOP</button>"
     "<div class='actions'><button class='arm' onclick='arm()'>CLEAR / ARM</button><button id='stateButton' class='state'>BOOT</button></div>"
     "<div class='cards'>"
+    "<div class='card'><div class='label'>Battery</div><div id='battery' class='value'>--%</div><div id='batterySub' class='sub'>-- V</div></div>"
+    "<div class='card'><div class='label'>Weight</div><div id='weight' class='value'>-- kg</div><div id='fsrSub' class='sub'>FSR</div></div>"
     "<div class='card'><div class='label'>Target distance</div><div id='distance' class='value'>-- m</div><div class='sub'>UWB</div></div>"
     "<div class='card'><div class='label'>Target bearing</div><div id='bearing' class='value'>-- deg</div><div class='sub'>Left + / Right -</div></div>"
-    "<div class='card'><div class='label'>Front clearance</div><div id='clearance' class='value'>-- m</div><div class='sub'>Lidar + ultrasonic</div></div>"
-    "<div class='card'><div class='label'>Weight</div><div id='weight' class='value'>-- kg</div><div id='fsrSub' class='sub'>FSR</div></div></div>"
+    "<div class='card'><div class='label'>Lidar front</div><div id='lidarDistance' class='value'>-- m</div><div class='sub'>Forward cone</div></div>"
+    "<div class='card'><div class='label'>Left ultrasonic</div><div id='ultraLeftDistance' class='value'>-- m</div><div class='sub'>Left side</div></div>"
+    "<div class='card'><div class='label'>Right ultrasonic</div><div id='ultraRightDistance' class='value'>-- m</div><div class='sub'>Right side</div></div>"
+    "</div>"
     "<div class='panel'><div class='modes'>"
     "<button id='autoMode' class='mode' onclick=\"setMode('auto')\">&#36319;&#38543;&#27169;&#24335;</button>"
     "<button id='manualMode' class='mode' onclick=\"setMode('manual')\">&#36965;&#25511;&#27169;&#24335;</button></div>"
@@ -130,8 +134,8 @@ static const char s_index_html[] =
     "<div class='panel summary'><strong id='modeText'>BOOT</strong><br>"
     "Motor pulse: <span id='pulses'>1500 / 1500 us</span><br>Measured: <span id='motion'>0.00 m/s, 0.00 rad/s</span>"
     "<div class='sensor-row'><span id='uwbChip' class='sensor'>UWB</span><span id='lidarChip' class='sensor'>LIDAR</span>"
-    "<span id='encoderChip' class='sensor'>ENCODER</span><span id='leftChip' class='sensor'>ULTRA L</span>"
-    "<span id='rightChip' class='sensor'>ULTRA R</span><span id='fsrChip' class='sensor'>FSR</span></div></div>"
+    "<span id='ultraLChip' class='sensor'>ULTRA L</span><span id='ultraRChip' class='sensor'>ULTRA R</span>"
+    "<span id='encoderChip' class='sensor'>ENCODER</span><span id='fsrChip' class='sensor'>FSR</span></div></div>"
     "<div id='error' class='error'></div><details><summary>Live data</summary><pre id='telemetry'>Loading...</pre></details>"
     "<script>"
     "const byId=id=>document.getElementById(id);let hold=null,holdV=0,holdW=0,pollBusy=false,speedTimer=null,editingUntil=0;"
@@ -152,9 +156,9 @@ static const char s_index_html[] =
     "byId('autoMode').className='mode '+(j.mode==='auto'?'active':'');byId('manualMode').className='mode '+(j.mode==='manual'?'active':'');byId('remotePanel').style.display=j.mode==='manual'?'block':'none';"
     "if(Date.now()>editingUntil&&!['followSpeed','followTurn','remoteSpeed'].includes(document.activeElement&&document.activeElement.id)){byId('followSpeed').value=j.follow_speed_pct;byId('followTurn').value=j.follow_turn_pct;byId('remoteSpeed').value=j.remote_speed_pct;}updateSpeedLabels();"
     "byId('distance').textContent=fmt(j.target_m,2)+' m';byId('bearing').textContent=fmt(Number(j.bearing_rad)*57.2958,1)+' deg';"
-    "byId('clearance').textContent=j.mode==='auto'&&Number(j.clearance_m)>0?fmt(j.clearance_m,2)+' m':'-- m';byId('weight').textContent=fmt(j.fsr_kg,1)+' kg';byId('fsrSub').textContent=fmt(j.fsr_v,3)+' V / raw '+j.fsr_raw;"
+    "byId('lidarDistance').textContent=Number(j.lidar_front_m)>0?fmt(j.lidar_front_m,2)+' m':'-- m';byId('ultraLeftDistance').textContent=j.ultra_left?fmt(j.ultra_left_m,2)+' m':'-- m';byId('ultraRightDistance').textContent=j.ultra_right?fmt(j.ultra_right_m,2)+' m':'-- m';byId('battery').textContent=fmt(j.battery_pct,0)+'%';byId('batterySub').textContent=fmt(j.battery_v,2)+' V';byId('weight').textContent=fmt(j.fsr_kg,1)+' kg';byId('fsrSub').textContent=fmt(j.fsr_v,3)+' V / raw '+j.fsr_raw;"
     "byId('pulses').textContent=j.left_us+' / '+j.right_us+' us';byId('motion').textContent=fmt(j.measured_v,2)+' m/s, '+fmt(j.measured_w,2)+' rad/s';"
-    "chip('uwbChip',j.uwb);chip('lidarChip',j.lidar);chip('encoderChip',j.encoder);chip('leftChip',j.ultra_left);chip('rightChip',j.ultra_right);chip('fsrChip',j.fsr);byId('telemetry').textContent=JSON.stringify(j,null,2);}"
+    "chip('uwbChip',j.uwb);chip('lidarChip',j.lidar);chip('ultraLChip',j.ultra_left);chip('ultraRChip',j.ultra_right);chip('encoderChip',j.encoder);chip('fsrChip',j.fsr);byId('telemetry').textContent=JSON.stringify(j,null,2);}"
     "async function poll(){if(pollBusy)return;pollBusy=true;try{const r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);render(await r.json());}catch(e){byId('connection').textContent='Disconnected';byId('connection').className='pill bad';}finally{pollBusy=false;}}"
     "document.addEventListener('contextmenu',e=>{if(e.target.closest('.drive'))e.preventDefault()});document.addEventListener('selectstart',e=>{if(e.target.closest('.drive'))e.preventDefault()});"
     "document.addEventListener('pointerdown',e=>{const b=e.target.closest('.drive');if(!b)return;e.preventDefault();startDrive(b,e.pointerId)});"
@@ -314,16 +318,20 @@ static esp_err_t status_handler(httpd_req_t *request)
     state_lock();
     telemetry = s_state.telemetry;
     state_unlock();
-    char json[896];
+    char json[1024];
     const int length = snprintf(
         json, sizeof(json),
         "{\"mode\":\"%s\",\"estop\":%s,\"client\":%s,\"age_ms\":%lu,"
         "\"follow_speed_pct\":%u,\"follow_turn_pct\":%u,"
         "\"remote_speed_pct\":%u,"
         "\"state\":\"%s\",\"uwb\":%s,\"lidar\":%s,\"ultra_left\":%s,"
-        "\"ultra_right\":%s,\"fsr\":%s,\"encoder\":%s,"
+        "\"ultra_right\":%s,\"fsr\":%s,\"battery\":%s,\"encoder\":%s,"
         "\"target_m\":%.3f,\"bearing_rad\":%.3f,\"clearance_m\":%.3f,"
-        "\"fsr_v\":%.3f,\"fsr_kg\":%.3f,\"fsr_raw\":%d,\"measured_v\":%.3f,\"measured_w\":%.3f,"
+        "\"clearance_left_m\":%.3f,\"clearance_right_m\":%.3f,\"avoid_heading_rad\":%.3f,"
+        "\"lidar_front_m\":%.3f,\"ultra_left_m\":%.3f,\"ultra_right_m\":%.3f,"
+        "\"fsr_v\":%.3f,\"fsr_kg\":%.3f,\"fsr_raw\":%d,"
+        "\"battery_v\":%.3f,\"battery_pct\":%.1f,\"battery_adc_v\":%.3f,\"battery_raw\":%d,"
+        "\"measured_v\":%.3f,\"measured_w\":%.3f,"
         "\"left_us\":%d,\"right_us\":%d}",
         command.mode == WEB_CONTROL_MODE_AUTO ? "auto" : "manual",
         command.estop_latched ? "true" : "false",
@@ -338,10 +346,17 @@ static esp_err_t status_handler(httpd_req_t *request)
         telemetry.ultrasonic_left_ok ? "true" : "false",
         telemetry.ultrasonic_right_ok ? "true" : "false",
         telemetry.fsr_ok ? "true" : "false",
+        telemetry.battery_ok ? "true" : "false",
         telemetry.encoder_ok ? "true" : "false",
         telemetry.target_distance_m, telemetry.target_bearing_rad,
-        telemetry.front_clearance_m, telemetry.fsr_voltage_v,
+        telemetry.front_clearance_m, telemetry.left_clearance_m,
+        telemetry.right_clearance_m, telemetry.chosen_heading_rad,
+        telemetry.front_clearance_m, telemetry.left_clearance_m,
+        telemetry.right_clearance_m,
+        telemetry.fsr_voltage_v,
         telemetry.fsr_weight_kg, telemetry.fsr_raw,
+        telemetry.battery_voltage_v, telemetry.battery_percent,
+        telemetry.battery_adc_voltage_v, telemetry.battery_raw,
         telemetry.measured_linear_mps, telemetry.measured_angular_rps,
         telemetry.left_pulse_us, telemetry.right_pulse_us);
     if (length < 0 || length >= (int)sizeof(json)) {

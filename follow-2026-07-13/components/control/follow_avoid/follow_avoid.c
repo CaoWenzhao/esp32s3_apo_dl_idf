@@ -57,19 +57,19 @@ fa_config_t fa_default_config(void)
     c.reacquire_timeout_s = 0.7f;
     c.search_timeout_s = 6.0f;
 
-    c.max_linear_mps = 0.7f;
+    c.max_linear_mps = 0.9f;
     c.max_angular_rps = 1.6f;
-    c.max_lin_accel_mps2 = 0.8f;
-    c.max_lin_decel_mps2 = 2.0f;   /* brake faster than we accelerate */
-    c.max_ang_accel_rps2 = 6.0f;
+    c.max_lin_accel_mps2 = 2.4f;
+    c.max_lin_decel_mps2 = 3.0f;   /* brake faster than we accelerate */
+    c.max_ang_accel_rps2 = 22.0f;
 
-    c.kp_dist = 0.9f;
-    c.kp_bear = 1.6f;
-    c.kd_bear = 0.25f;
+    c.kp_dist = 1.215f;
+    c.kp_bear = 1.76f;
+    c.kd_bear = 0.85f;
 
     c.emergency_distance_m = 0.35f;
-    c.slow_distance_m = 1.20f;
-    c.safe_distance_m = 0.60f;
+    c.slow_distance_m = 0.80f;
+    c.safe_distance_m = 0.80f;
     c.robot_half_width_m = 0.22f;
     c.front_cone_rad = (float)(40.0 * M_PI / 180.0); /* +-40 deg */
 
@@ -77,6 +77,7 @@ fa_config_t fa_default_config(void)
 
     c.w_goal = 1.0f;
     c.w_smooth = 0.35f;
+    c.w_clearance = 0.80f;
     return c;
 }
 
@@ -157,7 +158,8 @@ void fa_obstacle_add(fa_obstacle_field_t *f, float angle_rad, float dist_m)
 /* ----------------------------------------------------- obstacle queries */
 
 /* Closest obstacle within +-cone_half_rad of straight ahead. */
-static float front_clearance(const fa_obstacle_field_t *f, float cone_half_rad)
+float fa_obstacle_clearance(const fa_obstacle_field_t *f,
+                            float min_angle_rad, float max_angle_rad)
 {
     float best = FA_NO_OBSTACLE;
     if (f == NULL) {
@@ -165,13 +167,69 @@ static float front_clearance(const fa_obstacle_field_t *f, float cone_half_rad)
     }
     for (int i = 0; i < f->num_sectors; ++i) {
         const float a = sector_angle(f, i);
-        if (a >= -cone_half_rad && a <= cone_half_rad) {
+        if (a >= min_angle_rad && a <= max_angle_rad) {
             if (f->min_dist_m[i] < best) {
                 best = f->min_dist_m[i];
             }
         }
     }
     return best;
+}
+
+static float candidate_clearance(const fa_obstacle_field_t *f, int center)
+{
+    float best = FA_NO_OBSTACLE;
+    for (int i = center - 2; i <= center + 2; ++i) {
+        if (i >= 0 && i < f->num_sectors && f->min_dist_m[i] < best) {
+            best = f->min_dist_m[i];
+        }
+    }
+    return best;
+}
+
+static float best_side_clearance(const fa_obstacle_field_t *f, bool left)
+{
+    float best = 0.0f;
+    if (f == NULL) {
+        return best;
+    }
+    for (int i = 0; i < f->num_sectors; ++i) {
+        const float angle = sector_angle(f, i);
+        if ((left && angle <= 0.0f) || (!left && angle >= 0.0f)) {
+            continue;
+        }
+        const float clearance = candidate_clearance(f, i);
+        if (clearance > best) {
+            best = clearance;
+        }
+    }
+    return best;
+}
+
+static float avoid_direction(const fa_obstacle_field_t *field,
+                             const fa_range_t *ultra_left,
+                             const fa_range_t *ultra_right,
+                             float previous_heading)
+{
+    const bool left_valid = ultra_left != NULL && ultra_left->valid;
+    const bool right_valid = ultra_right != NULL && ultra_right->valid;
+    if (left_valid && right_valid) {
+        const float difference = ultra_left->dist_m - ultra_right->dist_m;
+        if (fabsf(difference) >= 0.05f) {
+            return difference > 0.0f ? 1.0f : -1.0f;
+        }
+    }
+
+    if (previous_heading > 0.05f) return 1.0f;
+    if (previous_heading < -0.05f) return -1.0f;
+
+    if (field != NULL) {
+        return best_side_clearance(field, true) >=
+                       best_side_clearance(field, false)
+                   ? 1.0f
+                   : -1.0f;
+    }
+    return 1.0f;
 }
 
 /*
@@ -230,8 +288,15 @@ static bool choose_heading(const fa_obstacle_field_t *f, const fa_config_t *cfg,
             continue;
         }
         const float a = sector_angle(f, i);
+        const float local_clearance = candidate_clearance(f, i);
+        const float clearance_ref = 2.5f;
+        const float clearance_norm = local_clearance >= FA_NO_OBSTACLE * 0.5f
+                                         ? 1.0f
+                                         : clampf(local_clearance / clearance_ref,
+                                                  0.0f, 1.0f);
         const float cost = cfg->w_goal * fabsf(fa_wrap_pi(a - goal_rad)) +
-                           cfg->w_smooth * fabsf(fa_wrap_pi(a - prev_rad));
+                           cfg->w_smooth * fabsf(fa_wrap_pi(a - prev_rad)) +
+                           cfg->w_clearance * (1.0f - clearance_norm);
         if (cost < best_cost) {
             best_cost = cost;
             best = i;
@@ -262,18 +327,10 @@ fa_output_t fa_update(fa_ctx_t *ctx, const fa_target_t *target,
         dt_s = 0.02f;
     }
 
-    /* --- 1. Fuse the front clearance from lidar + the two ultrasonics ----- */
-    float clearance = front_clearance(field, cfg->front_cone_rad);
-    const float ul = (ultra_left && ultra_left->valid) ? ultra_left->dist_m
-                                                       : FA_NO_OBSTACLE;
-    const float ur = (ultra_right && ultra_right->valid) ? ultra_right->dist_m
-                                                          : FA_NO_OBSTACLE;
-    if (ul < clearance) {
-        clearance = ul;
-    }
-    if (ur < clearance) {
-        clearance = ur;
-    }
+    /* Front clearance comes only from the forward lidar cone. The side-facing
+     * ultrasonics select an avoidance direction, never front clearance. */
+    float clearance = fa_obstacle_clearance(field, -cfg->front_cone_rad,
+                                             cfg->front_cone_rad);
     out.front_clearance_m = clearance;
 
     /* --- 2. Track target loss ------------------------------------------- */
@@ -289,38 +346,16 @@ fa_output_t fa_update(fa_ctx_t *ctx, const fa_target_t *target,
     /* --- 3. Emergency stop has top priority ----------------------------- */
     if (clearance <= cfg->emergency_distance_m) {
         ctx->state = FA_STATE_ESTOP;
-        /* Rotate in place toward the freer side to wiggle out, but never
-         * drive forward into the obstacle. */
-        float turn = 0.0f;
-        if (field != NULL) {
-            /* Compare clearance of the left half vs right half of the FOV. */
-            float left_min = FA_NO_OBSTACLE;
-            float right_min = FA_NO_OBSTACLE;
-            for (int i = 0; i < field->num_sectors; ++i) {
-                const float a = sector_angle(field, i);
-                if (a > 0 && field->min_dist_m[i] < left_min) {
-                    left_min = field->min_dist_m[i];
-                }
-                if (a < 0 && field->min_dist_m[i] < right_min) {
-                    right_min = field->min_dist_m[i];
-                }
-            }
-            if (ul < left_min) {
-                left_min = ul;
-            }
-            if (ur < right_min) {
-                right_min = ur;
-            }
-            turn = (left_min >= right_min) ? cfg->search_angular_rps
-                                           : -cfg->search_angular_rps;
-        }
+        const float turn = avoid_direction(field, ultra_left, ultra_right,
+                                           ctx->prev_heading) *
+                           cfg->search_angular_rps;
         ctx->cmd_v = ramp(ctx->cmd_v, 0.0f, cfg->max_lin_decel_mps2, dt_s);
         ctx->cmd_w = ramp(ctx->cmd_w, turn, cfg->max_ang_accel_rps2, dt_s);
         out.v_mps = ctx->cmd_v;
         out.omega_rps = ctx->cmd_w;
         out.state = ctx->state;
         out.blocked = true;
-        ctx->prev_heading = (turn >= 0.0f) ? 0.5f : -0.5f;
+        ctx->prev_heading = turn >= 0.0f ? 0.5f : -0.5f;
         return out;
     }
 
@@ -360,7 +395,8 @@ fa_output_t fa_update(fa_ctx_t *ctx, const fa_target_t *target,
         return out;
     }
 
-    /* --- 5. Following: pick a heading (VFH around obstacles) ------------- */
+    /* Lidar alone decides whether avoidance is active. Once the forward cone
+     * is clear again, steering immediately returns to the UWB bearing. */
     ctx->search_timer_s = 0.0f;
     const float goal = target->bearing_rad;
     out.goal_bearing_rad = goal;
@@ -368,38 +404,12 @@ fa_output_t fa_update(fa_ctx_t *ctx, const fa_target_t *target,
     float heading = goal;
     bool goal_blocked = false;
 
-    if (field != NULL && field->num_sectors > 0) {
-        bool blocked[FA_MAX_SECTORS];
-        const int free_count = build_blocked(field, cfg, blocked);
-        const int goal_idx = sector_of(field, goal);
-
-        /* The goal direction is obstructed if it falls in a blocked sector or
-         * lies outside the lidar FOV while something is close ahead. */
-        if (goal_idx >= 0) {
-            goal_blocked = blocked[goal_idx];
-        }
-        if (goal_blocked || goal_idx < 0) {
-            float h;
-            if (free_count > 0 &&
-                choose_heading(field, cfg, blocked, goal, ctx->prev_heading,
-                               &h)) {
-                heading = h;
-            } else {
-                /* Fully boxed in: treat as emergency-ish, stop & turn. */
-                ctx->state = FA_STATE_ESTOP;
-                ctx->cmd_v =
-                    ramp(ctx->cmd_v, 0.0f, cfg->max_lin_decel_mps2, dt_s);
-                const float dir = (goal >= 0.0f) ? 1.0f : -1.0f;
-                ctx->cmd_w = ramp(ctx->cmd_w, dir * cfg->search_angular_rps,
-                                  cfg->max_ang_accel_rps2, dt_s);
-                out.v_mps = ctx->cmd_v;
-                out.omega_rps = ctx->cmd_w;
-                out.state = ctx->state;
-                out.blocked = true;
-                out.chosen_heading_rad = heading;
-                return out;
-            }
-        }
+    if (field != NULL && clearance < cfg->safe_distance_m) {
+        goal_blocked = true;
+        const float direction = avoid_direction(field, ultra_left,
+                                                ultra_right,
+                                                ctx->prev_heading);
+        heading = direction * (float)(55.0 * M_PI / 180.0);
     }
 
     ctx->state = goal_blocked ? FA_STATE_AVOID : FA_STATE_FOLLOW;
@@ -407,8 +417,21 @@ fa_output_t fa_update(fa_ctx_t *ctx, const fa_target_t *target,
     out.chosen_heading_rad = heading;
 
     /* --- 6. Angular control toward the chosen heading ------------------- */
-    const float heading_rate = (heading - ctx->prev_heading) / dt_s;
-    float omega_des = cfg->kp_bear * heading + cfg->kd_bear * heading_rate;
+    const float heading_rate = goal_blocked ? 0.0f : target->bearing_rate_rps;
+    float omega_des = 0.0f;
+    const float lateral_m = target->distance_m * sinf(target->bearing_rad);
+    if (goal_blocked ||
+        (fabsf(heading) >= (float)(8.0 * M_PI / 180.0) &&
+         fabsf(lateral_m) >= 0.18f)) {
+        omega_des = goal_blocked
+                        ? (heading > 0.0f ? cfg->max_angular_rps
+                                          : -cfg->max_angular_rps)
+                        : cfg->kp_bear * heading +
+                              cfg->kd_bear * heading_rate;
+        if (!goal_blocked && fabsf(heading) < (float)(12.0 * M_PI / 180.0)) {
+            omega_des *= 0.70f;
+        }
+    }
     omega_des = clampf(omega_des, -cfg->max_angular_rps, cfg->max_angular_rps);
 
     /* --- 7. Linear control from range error, then governors ------------- */
@@ -426,8 +449,8 @@ fa_output_t fa_update(fa_ctx_t *ctx, const fa_target_t *target,
     v_des = clampf(v_des, 0.0f, cfg->max_linear_mps);
 
     /* Slow down for a sharp turn (don't barrel forward while pivoting). */
-    const float turn_scale =
-        clampf(1.0f - fabsf(heading) / (0.5f * (float)M_PI), 0.0f, 1.0f);
+    const float turn_scale = clampf(
+        1.0f - 0.18f * fabsf(heading) / (0.5f * (float)M_PI), 0.76f, 1.0f);
     v_des *= turn_scale;
 
     /* Slow down as the front clearance shrinks (linear between emergency and

@@ -28,6 +28,10 @@
 #define FSR_ADC_UNIT                  ADC_UNIT_1
 #define FSR_ADC_CHANNEL               ADC_CHANNEL_7
 
+#define PIN_BATTERY_ADC               GPIO_NUM_3
+#define BATTERY_ADC_UNIT              ADC_UNIT_1
+#define BATTERY_ADC_CHANNEL           ADC_CHANNEL_2
+
 #define UWB_BAUD_RATE                 115200
 #define RPLIDAR_BAUD_RATE             460800
 #define ULTRASONIC_BAUD_RATE          9600

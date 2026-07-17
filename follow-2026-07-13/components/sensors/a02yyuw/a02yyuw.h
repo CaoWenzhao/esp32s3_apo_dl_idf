@@ -50,5 +50,6 @@ esp_err_t a02yyuw_init_dev(a02yyuw_t *dev, const a02yyuw_config_t *config);
 esp_err_t a02yyuw_read_dev(a02yyuw_t *dev,
                            a02yyuw_reading_t *out,
                            uint32_t wait_ms);
+esp_err_t a02yyuw_set_rx_enabled(a02yyuw_t *dev, bool enabled);
 void a02yyuw_deinit_dev(a02yyuw_t *dev);
 

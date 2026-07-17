@@ -43,6 +43,7 @@ typedef struct {
     bool valid;          /* true when a fresh, trustworthy fix is available */
     float distance_m;    /* range to the user */
     float bearing_rad;   /* direction to the user in the body frame (see above) */
+    float bearing_rate_rps; /* filtered target bearing rate */
 } fa_target_t;
 
 /* A single ultrasonic reading (front-corner). */
@@ -121,6 +122,7 @@ typedef struct {
     /* VFH cost weights (lower cost = preferred heading) */
     float w_goal;              /* deviation from the target bearing */
     float w_smooth;            /* deviation from the previous heading */
+    float w_clearance;         /* preference for directions with more clearance */
 } fa_config_t;
 
 typedef struct {
@@ -147,6 +149,10 @@ void fa_obstacle_reset(fa_obstacle_field_t *f, int num_sectors, float fov_rad);
 /* Add one obstacle point in the BODY frame (angle per the convention above).
  * Points outside the FOV or with non-positive distance are ignored. */
 void fa_obstacle_add(fa_obstacle_field_t *f, float angle_rad, float dist_m);
+
+/* Closest obstacle in an angular window. Returns FA_NO_OBSTACLE if empty. */
+float fa_obstacle_clearance(const fa_obstacle_field_t *f,
+                            float min_angle_rad, float max_angle_rad);
 
 /*
  * Run one control step.

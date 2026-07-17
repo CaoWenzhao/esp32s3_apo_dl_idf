@@ -24,8 +24,17 @@ typedef struct {
     bool valid;
 } fsr_adc_reading_t;
 
+typedef struct {
+    int raw;
+    float adc_voltage_v;
+    float battery_voltage_v;
+    float percent;
+    bool valid;
+} battery_adc_reading_t;
+
 fsr_adc_config_t fsr_adc_default_config(void);
 esp_err_t fsr_adc_init(const fsr_adc_config_t *config);
 esp_err_t fsr_adc_read(fsr_adc_reading_t *out);
+esp_err_t battery_adc_read(battery_adc_reading_t *out);
 void fsr_adc_deinit(void);
 

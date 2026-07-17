@@ -1,225 +1,226 @@
 #include "sw_uart.h"
+
 #include <string.h>
-#include "driver/gpio.h"
-#include "esp_log.h"
-#include "esp_rom_gpio.h"
+
 #include "freertos/task.h"
 
-static const char *TAG = "sw_uart";
+typedef struct {
+    uint8_t level;
+    uint32_t start_us;
+    uint32_t end_us;
+} uart_segment_t;
 
-static bool IRAM_ATTR sw_uart_timer_cb(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
+static bool IRAM_ATTR sw_uart_rx_done(rmt_channel_handle_t channel,
+                                      const rmt_rx_done_event_data_t *edata,
+                                      void *user_ctx)
 {
+    (void)channel;
     sw_uart_t *uart = (sw_uart_t *)user_ctx;
-    int level = gpio_get_level(uart->rx_gpio);
-    bool yield = false;
-
-    switch (uart->state) {
-        case SW_UART_START:
-            if (level == 0) {
-                uart->current_byte = 0;
-                uart->bit_count = 0;
-                uart->state = SW_UART_DATA;
-                
-                gptimer_alarm_config_t alarm_config = {
-                    .alarm_count = edata->alarm_value + uart->bit_us,
-                };
-                gptimer_set_alarm_action(timer, &alarm_config);
-            } else {
-                uart->state = SW_UART_IDLE;
-                gptimer_stop(timer);
-                gpio_intr_enable(uart->rx_gpio);
-            }
-            break;
-            
-        case SW_UART_DATA:
-            uart->current_byte >>= 1;
-            if (level) {
-                uart->current_byte |= 0x80;
-            }
-            uart->bit_count++;
-            
-            if (uart->bit_count >= 8) {
-                uart->state = SW_UART_STOP;
-            }
-            
-            gptimer_alarm_config_t alarm_config_data = {
-                .alarm_count = edata->alarm_value + uart->bit_us,
-            };
-            gptimer_set_alarm_action(timer, &alarm_config_data);
-            break;
-            
-        case SW_UART_STOP:
-            if (level) {
-                portENTER_CRITICAL_ISR(&uart->lock);
-                int next_head = uart->rx_head + 1;
-                if (next_head >= SW_UART_MAX_RX_BUF) {
-                    next_head = 0;
-                }
-                
-                if (next_head != uart->rx_tail) {
-                    uart->rx_buf[uart->rx_head] = uart->current_byte;
-                    uart->rx_head = next_head;
-                }
-                portEXIT_CRITICAL_ISR(&uart->lock);
-            }
-            uart->state = SW_UART_IDLE;
-            gptimer_stop(timer);
-            gpio_intr_enable(uart->rx_gpio);
-            break;
-            
-        default:
-            uart->state = SW_UART_IDLE;
-            gptimer_stop(timer);
-            gpio_intr_enable(uart->rx_gpio);
-            break;
-    }
-    return yield;
+    BaseType_t wake = pdFALSE;
+    size_t symbol_count = edata->num_symbols;
+    uart->receiving = false;
+    uart->rx_events++;
+    uart->last_symbol_count = symbol_count;
+    xQueueOverwriteFromISR(uart->rx_queue, &symbol_count, &wake);
+    return wake == pdTRUE;
 }
 
-static void IRAM_ATTR sw_uart_gpio_isr(void *arg)
+static esp_err_t sw_uart_start_receive(sw_uart_t *uart)
 {
-    sw_uart_t *uart = (sw_uart_t *)arg;
-    
-    if (gpio_get_level(uart->rx_gpio) != 0) return;
-    
-    gpio_intr_disable(uart->rx_gpio);
-    uart->state = SW_UART_START;
-    gptimer_set_raw_count(uart->timer, 0);
-    
-    gptimer_alarm_config_t alarm_config = {
-        .alarm_count = uart->half_bit_us,
-        .flags.auto_reload_on_alarm = false,
-    };
-    
-    gptimer_set_alarm_action(uart->timer, &alarm_config);
-    gptimer_start(uart->timer);
+    if (!uart->rx_enabled || uart->receiving) return ESP_OK;
+    esp_err_t ret = rmt_receive(uart->rx_channel, uart->symbols,
+                                sizeof(uart->symbols),
+                                &uart->receive_config);
+    if (ret == ESP_OK) uart->receiving = true;
+    return ret;
+}
+
+static int segment_level_at(const uart_segment_t *segments, int segment_count,
+                            uint32_t sample_us)
+{
+    for (int i = 0; i < segment_count; ++i) {
+        if (sample_us >= segments[i].start_us &&
+            sample_us < segments[i].end_us) {
+            return segments[i].level;
+        }
+    }
+    return -1;
+}
+
+static int decode_uart(const sw_uart_t *uart, size_t symbol_count,
+                       uint8_t *output, int output_size)
+{
+    uart_segment_t segments[SW_UART_RMT_SYMBOLS * 2];
+    int segment_count = 0;
+    uint32_t cursor_us = 0;
+    if (symbol_count > SW_UART_RMT_SYMBOLS) {
+        symbol_count = SW_UART_RMT_SYMBOLS;
+    }
+
+    for (size_t i = 0; i < symbol_count; ++i) {
+        const rmt_symbol_word_t symbol = uart->symbols[i];
+        if (symbol.duration0 > 0) {
+            segments[segment_count++] = (uart_segment_t) {
+                .level = symbol.level0,
+                .start_us = cursor_us,
+                .end_us = cursor_us + symbol.duration0,
+            };
+            cursor_us += symbol.duration0;
+        }
+        if (symbol.duration1 > 0) {
+            segments[segment_count++] = (uart_segment_t) {
+                .level = symbol.level1,
+                .start_us = cursor_us,
+                .end_us = cursor_us + symbol.duration1,
+            };
+            cursor_us += symbol.duration1;
+        }
+    }
+
+    if (segment_count < (int)(SW_UART_RMT_SYMBOLS * 2)) {
+        segments[segment_count++] = (uart_segment_t) {
+            .level = 1,
+            .start_us = cursor_us,
+            .end_us = cursor_us + 3000,
+        };
+    }
+
+    int output_count = 0;
+    uint32_t ignore_before_us = 0;
+    for (int i = 0; i < segment_count && output_count < output_size; ++i) {
+        const bool falling_edge = segments[i].level == 0 &&
+                                  (i == 0 || segments[i - 1].level == 1);
+        const uint32_t start_us = segments[i].start_us;
+        if (!falling_edge || start_us < ignore_before_us) continue;
+
+        uint8_t value = 0;
+        bool complete = true;
+        for (int bit = 0; bit < 8; ++bit) {
+            const uint32_t sample_us = start_us +
+                (uint32_t)((3 + 2 * bit) * uart->bit_us / 2);
+            int level = segment_level_at(segments, segment_count, sample_us);
+            if (level < 0) {
+                complete = false;
+                break;
+            }
+            if (level) value |= (uint8_t)(1U << bit);
+        }
+
+        const uint32_t stop_sample_us = start_us +
+            (uint32_t)(19 * uart->bit_us / 2);
+        if (complete &&
+            segment_level_at(segments, segment_count, stop_sample_us) == 1) {
+            output[output_count++] = value;
+            ignore_before_us = start_us + 10 * uart->bit_us;
+        }
+    }
+    return output_count;
 }
 
 sw_uart_config_t sw_uart_default_config(int rx_gpio, int tx_gpio)
 {
-    sw_uart_config_t config = {
-        .rx_gpio = rx_gpio, 
+    return (sw_uart_config_t) {
+        .rx_gpio = rx_gpio,
         .tx_gpio = tx_gpio,
-        .baudrate = 9600, 
+        .baudrate = 9600,
         .rx_buffer_size = SW_UART_MAX_RX_BUF,
     };
-    return config;
 }
 
 esp_err_t sw_uart_init(sw_uart_t *uart, const sw_uart_config_t *config)
 {
     if (!uart || !config || config->rx_gpio < 0) return ESP_ERR_INVALID_ARG;
-    
+
     memset(uart, 0, sizeof(*uart));
-    portMUX_TYPE init_lock = portMUX_INITIALIZER_UNLOCKED;
-    uart->lock = init_lock;
     uart->rx_gpio = config->rx_gpio;
     uart->tx_gpio = config->tx_gpio;
     uart->baudrate = config->baudrate > 0 ? config->baudrate : 9600;
-    uart->state = SW_UART_IDLE;
-    
-    uart->bit_us = 1000000 / uart->baudrate;
-    if (uart->bit_us < 1) uart->bit_us = 1;
-    
-    uart->half_bit_us = uart->bit_us / 2;
-    if (uart->half_bit_us < 1) uart->half_bit_us = 1;
-    
-    gptimer_config_t timer_config = {
-        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-        .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000, 
-    };
-    
-    esp_err_t ret = gptimer_new_timer(&timer_config, &uart->timer);
-    if (ret != ESP_OK) return ret;
-    
-    gptimer_event_callbacks_t cbs = { .on_alarm = sw_uart_timer_cb };
-    ret = gptimer_register_event_callbacks(uart->timer, &cbs, uart);
-    if (ret != ESP_OK) goto err_timer;
-    
-    ret = gptimer_enable(uart->timer);
-    if (ret != ESP_OK) goto err_timer;
-    
-    gpio_config_t gpio_cfg = {
-        .pin_bit_mask = (1ULL << uart->rx_gpio),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE,
-    };
-    
-    ret = gpio_config(&gpio_cfg);
-    if (ret != ESP_OK) goto err_timer;
-    
-    /* gpio_install_isr_service is not ref-counted: if chassis or another
-     * sensor already installed it, the call returns ESP_ERR_INVALID_STATE.
-     * That is expected and harmless — treat it as success. */
-    esp_err_t isr_ret = gpio_install_isr_service(0);
-    if (isr_ret != ESP_OK && isr_ret != ESP_ERR_INVALID_STATE) {
-        ret = isr_ret;
-        goto err_timer;
-    }
-    ret = gpio_isr_handler_add(uart->rx_gpio, sw_uart_gpio_isr, uart);
-    if (ret != ESP_OK) goto err_timer;
-    
-    uart->initialized = true;
-    return ESP_OK;
+    uart->bit_us = 1000000U / (uint32_t)uart->baudrate;
+    uart->rx_queue = xQueueCreate(1, sizeof(size_t));
+    if (!uart->rx_queue) return ESP_ERR_NO_MEM;
 
-err_timer:
-    gptimer_disable(uart->timer);
-    gptimer_del_timer(uart->timer);
+    rmt_rx_channel_config_t channel_config = {
+        .gpio_num = uart->rx_gpio,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 1000000,
+        .mem_block_symbols = SW_UART_RMT_SYMBOLS,
+        .intr_priority = 0,
+    };
+    esp_err_t ret = rmt_new_rx_channel(&channel_config, &uart->rx_channel);
+    if (ret != ESP_OK) goto fail_queue;
+
+    rmt_rx_event_callbacks_t callbacks = {
+        .on_recv_done = sw_uart_rx_done,
+    };
+    ret = rmt_rx_register_event_callbacks(uart->rx_channel, &callbacks, uart);
+    if (ret != ESP_OK) goto fail_channel;
+
+    ret = rmt_enable(uart->rx_channel);
+    if (ret != ESP_OK) goto fail_channel;
+
+    uart->receive_config = (rmt_receive_config_t) {
+        .signal_range_min_ns = 1000,
+        .signal_range_max_ns = 3000000,
+    };
+    uart->rx_enabled = true;
+    uart->initialized = true;
+    ret = sw_uart_start_receive(uart);
+    if (ret == ESP_OK) return ESP_OK;
+
+    uart->initialized = false;
+    rmt_disable(uart->rx_channel);
+fail_channel:
+    rmt_del_channel(uart->rx_channel);
+fail_queue:
+    vQueueDelete(uart->rx_queue);
     return ret;
 }
 
-int sw_uart_read_bytes(sw_uart_t *uart, uint8_t *buf, int max_len, uint32_t timeout_ms)
+int sw_uart_read_bytes(sw_uart_t *uart, uint8_t *buf, int max_len,
+                       uint32_t timeout_ms)
 {
-    if (!uart || !buf || max_len <= 0) return 0;
-    uint32_t waited = 0;
-    
-    while (waited <= timeout_ms) {
-        portENTER_CRITICAL(&uart->lock);
-        int tail = uart->rx_tail, head = uart->rx_head;
-        portEXIT_CRITICAL(&uart->lock);
-        
-        int avail = (head >= tail) ? (head - tail) : (SW_UART_MAX_RX_BUF - tail + head);
-        if (avail > 0) {
-            int to_read = avail < max_len ? avail : max_len;
-            for (int i = 0; i < to_read; i++) {
-                buf[i] = uart->rx_buf[tail];
-                tail = (tail + 1) % SW_UART_MAX_RX_BUF;
-            }
-            
-            portENTER_CRITICAL(&uart->lock);
-            uart->rx_tail = tail;
-            portEXIT_CRITICAL(&uart->lock);
-            
-            return to_read;
-        }
-        
-        if (timeout_ms == 0) break;
-        vTaskDelay(pdMS_TO_TICKS(1));
-        waited++;
+    if (!uart || !uart->initialized || !buf || max_len <= 0) return 0;
+
+    size_t symbol_count = 0;
+    if (xQueueReceive(uart->rx_queue, &symbol_count,
+                      pdMS_TO_TICKS(timeout_ms)) != pdPASS) {
+        return 0;
     }
-    return 0;
+
+    int decoded = decode_uart(uart, symbol_count, buf, max_len);
+    uart->decoded_bytes += (uint32_t)decoded;
+    sw_uart_start_receive(uart);
+    return decoded;
+}
+
+esp_err_t sw_uart_set_rx_enabled(sw_uart_t *uart, bool enabled)
+{
+    if (!uart || !uart->initialized) return ESP_ERR_INVALID_STATE;
+    if (uart->rx_enabled == enabled) return ESP_OK;
+
+    uart->rx_enabled = enabled;
+    uart->receiving = false;
+    xQueueReset(uart->rx_queue);
+    if (!enabled) return rmt_disable(uart->rx_channel);
+
+    esp_err_t ret = rmt_enable(uart->rx_channel);
+    if (ret != ESP_OK) return ret;
+    return sw_uart_start_receive(uart);
 }
 
 void sw_uart_flush(sw_uart_t *uart)
 {
-    if (!uart) return;
-    portENTER_CRITICAL(&uart->lock);
-    uart->rx_head = uart->rx_tail = 0;
-    portEXIT_CRITICAL(&uart->lock);
+    if (uart && uart->rx_queue) xQueueReset(uart->rx_queue);
 }
 
 void sw_uart_deinit(sw_uart_t *uart)
 {
     if (!uart || !uart->initialized) return;
-    gpio_isr_handler_remove(uart->rx_gpio);
-    /* 定时器可能处于任意状态（IDLE 时未启动，或正在回调中运行）。
-     * 按顺序安全拆卸：stop → disable → delete，忽略每步的状态错误。 */
-    gptimer_stop(uart->timer);
-    gptimer_disable(uart->timer);
-    gptimer_del_timer(uart->timer);
-    gpio_reset_pin(uart->rx_gpio);
+    uart->rx_enabled = false;
     uart->initialized = false;
+    rmt_disable(uart->rx_channel);
+    rmt_del_channel(uart->rx_channel);
+    vQueueDelete(uart->rx_queue);
+    uart->rx_channel = NULL;
+    uart->rx_queue = NULL;
 }

@@ -28,7 +28,7 @@ config FOLLOW_ROBOT_TRACK_WIDTH_MM
 
 config FOLLOW_ROBOT_MAX_WHEEL_SPEED_MMPS
     int "Calibrated maximum wheel speed (mm/s)"
-    default 800
+    default 900
 
 config FOLLOW_ROBOT_FOLLOW_DISTANCE_MM
     int "Desired UWB target distance (mm)"
@@ -40,7 +40,7 @@ config FOLLOW_ROBOT_STOP_BAND_MM
 
 config FOLLOW_ROBOT_MAX_LINEAR_MMPS
     int "Maximum automatic linear speed (mm/s)"
-    default 700
+    default 900
 
 config FOLLOW_ROBOT_MAX_ANGULAR_MRADPS
     int "Maximum automatic angular speed (mrad/s)"
@@ -56,7 +56,7 @@ config FOLLOW_ROBOT_SLOW_DIST_MM
 
 config FOLLOW_ROBOT_SAFE_DIST_MM
     int "Blocked lidar sector distance (mm)"
-    default 600
+    default 800
 
 config FOLLOW_ROBOT_ROBOT_HALF_WIDTH_MM
     int "Robot half-width used for obstacle inflation (mm)"

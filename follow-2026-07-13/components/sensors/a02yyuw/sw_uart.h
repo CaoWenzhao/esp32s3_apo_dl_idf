@@ -4,10 +4,12 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
-#include "driver/gptimer.h"
+#include "driver/rmt_rx.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 #define SW_UART_MAX_RX_BUF 1024
+#define SW_UART_RMT_SYMBOLS 64
 
 typedef struct {
     int rx_gpio;
@@ -27,23 +29,22 @@ typedef struct sw_uart_inst {
     int rx_gpio;
     int tx_gpio;
     int baudrate;
-    uint8_t rx_buf[SW_UART_MAX_RX_BUF];
-    volatile int rx_head;
-    volatile int rx_tail;
-    volatile sw_uart_state_t state;
-    volatile uint8_t current_byte;
-    volatile int bit_count;
-    
-    gptimer_handle_t timer;
-    portMUX_TYPE lock;
-    
+    rmt_channel_handle_t rx_channel;
+    QueueHandle_t rx_queue;
+    rmt_symbol_word_t symbols[SW_UART_RMT_SYMBOLS];
+    rmt_receive_config_t receive_config;
     uint32_t bit_us;
-    uint32_t half_bit_us;
     bool initialized;
+    volatile bool rx_enabled;
+    volatile bool receiving;
+    volatile uint32_t rx_events;
+    volatile uint32_t decoded_bytes;
+    volatile size_t last_symbol_count;
 } sw_uart_t;
 
 sw_uart_config_t sw_uart_default_config(int rx_gpio, int tx_gpio);
 esp_err_t sw_uart_init(sw_uart_t *uart, const sw_uart_config_t *config);
 int sw_uart_read_bytes(sw_uart_t *uart, uint8_t *buf, int max_len, uint32_t timeout_ms);
+esp_err_t sw_uart_set_rx_enabled(sw_uart_t *uart, bool enabled);
 void sw_uart_flush(sw_uart_t *uart);
 void sw_uart_deinit(sw_uart_t *uart);

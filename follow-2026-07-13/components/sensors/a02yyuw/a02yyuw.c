@@ -135,6 +135,13 @@ esp_err_t a02yyuw_read_dev(a02yyuw_t *dev,
     return a02yyuw_parse_latest(buf, (size_t)len, out) ? ESP_OK : ESP_ERR_INVALID_CRC;
 }
 
+esp_err_t a02yyuw_set_rx_enabled(a02yyuw_t *dev, bool enabled)
+{
+    if (dev == NULL || !dev->initialized) return ESP_ERR_INVALID_STATE;
+    if (!dev->use_sw_uart) return ESP_ERR_NOT_SUPPORTED;
+    return sw_uart_set_rx_enabled(&dev->sw_uart, enabled);
+}
+
 void a02yyuw_deinit_dev(a02yyuw_t *dev)
 {
     if (dev == NULL || !dev->initialized) {
