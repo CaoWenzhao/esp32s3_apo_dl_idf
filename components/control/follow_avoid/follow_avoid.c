@@ -70,6 +70,8 @@ fa_config_t fa_default_config(void)
     c.emergency_distance_m = 0.35f;
     c.slow_distance_m = 0.80f;
     c.safe_distance_m = 0.80f;
+    c.side_release_distance_m = 0.60f;
+    c.avoid_forward_mps = 0.35f;
     c.robot_half_width_m = 0.22f;
     c.front_cone_rad = (float)(40.0 * M_PI / 180.0); /* +-40 deg */
 
@@ -343,20 +345,66 @@ fa_output_t fa_update(fa_ctx_t *ctx, const fa_target_t *target,
         ctx->lost_timer_s += dt_s;
     }
 
-    /* --- 3. Emergency stop has top priority ----------------------------- */
-    if (clearance <= cfg->emergency_distance_m) {
-        ctx->state = FA_STATE_ESTOP;
-        const float turn = avoid_direction(field, ultra_left, ultra_right,
-                                           ctx->prev_heading) *
-                           cfg->search_angular_rps;
-        ctx->cmd_v = ramp(ctx->cmd_v, 0.0f, cfg->max_lin_decel_mps2, dt_s);
-        ctx->cmd_w = ramp(ctx->cmd_w, turn, cfg->max_ang_accel_rps2, dt_s);
-        out.v_mps = ctx->cmd_v;
-        out.omega_rps = ctx->cmd_w;
+    const bool lidar_blocked = field != NULL &&
+                               clearance < cfg->safe_distance_m;
+
+    if (!ctx->avoidance_active && lidar_blocked && have_target) {
+        ctx->avoidance_active = true;
+        ctx->avoidance_direction = avoid_direction(
+            field, ultra_left, ultra_right, ctx->prev_heading);
+    }
+
+    if (ctx->avoidance_active) {
+        ctx->state = FA_STATE_AVOID;
         out.state = ctx->state;
         out.blocked = true;
-        ctx->prev_heading = turn >= 0.0f ? 0.5f : -0.5f;
-        return out;
+        out.goal_bearing_rad = have_target ? target->bearing_rad
+                                           : ctx->last_known_bearing;
+
+        if (lidar_blocked || field == NULL) {
+            /* Turning is always allowed, even at zero front clearance. Stop
+             * forward motion immediately and pivot in the locked direction. */
+            ctx->cmd_v = 0.0f;
+            ctx->cmd_w = ramp(ctx->cmd_w,
+                              ctx->avoidance_direction * cfg->max_angular_rps,
+                              cfg->max_ang_accel_rps2, dt_s);
+            ctx->prev_heading = ctx->avoidance_direction *
+                                (float)(55.0 * M_PI / 180.0);
+            out.v_mps = 0.0f;
+            out.omega_rps = ctx->cmd_w;
+            out.chosen_heading_rad = ctx->prev_heading;
+            return out;
+        }
+
+        /* After a right turn watch only the left sensor; after a left turn
+         * watch only the right sensor. Keep driving straight until that
+         * opposite side has cleared the obstacle by the release threshold. */
+        const fa_range_t *opposite_side = ctx->avoidance_direction < 0.0f
+                                              ? ultra_left
+                                              : ultra_right;
+        const bool opposite_clear = opposite_side != NULL &&
+                                    opposite_side->valid &&
+                                    opposite_side->dist_m >
+                                        cfg->side_release_distance_m;
+        if (opposite_clear) {
+            ctx->avoidance_active = false;
+            ctx->avoidance_direction = 0.0f;
+            ctx->prev_heading = have_target ? target->bearing_rad : 0.0f;
+        } else {
+            const float escape_speed = opposite_side != NULL &&
+                                               opposite_side->valid
+                                           ? cfg->avoid_forward_mps
+                                           : 0.0f;
+            ctx->cmd_v = ramp(ctx->cmd_v, escape_speed,
+                              cfg->max_lin_accel_mps2, dt_s);
+            ctx->cmd_w = ramp(ctx->cmd_w, 0.0f,
+                              cfg->max_ang_accel_rps2, dt_s);
+            ctx->prev_heading = 0.0f;
+            out.v_mps = ctx->cmd_v;
+            out.omega_rps = ctx->cmd_w;
+            out.chosen_heading_rad = 0.0f;
+            return out;
+        }
     }
 
     /* --- 4. No target: search, then idle -------------------------------- */
@@ -402,18 +450,10 @@ fa_output_t fa_update(fa_ctx_t *ctx, const fa_target_t *target,
     out.goal_bearing_rad = goal;
 
     float heading = goal;
-    bool goal_blocked = false;
+    const bool goal_blocked = false;
 
-    if (field != NULL && clearance < cfg->safe_distance_m) {
-        goal_blocked = true;
-        const float direction = avoid_direction(field, ultra_left,
-                                                ultra_right,
-                                                ctx->prev_heading);
-        heading = direction * (float)(55.0 * M_PI / 180.0);
-    }
-
-    ctx->state = goal_blocked ? FA_STATE_AVOID : FA_STATE_FOLLOW;
-    out.blocked = goal_blocked;
+    ctx->state = FA_STATE_FOLLOW;
+    out.blocked = false;
     out.chosen_heading_rad = heading;
 
     /* --- 6. Angular control toward the chosen heading ------------------- */

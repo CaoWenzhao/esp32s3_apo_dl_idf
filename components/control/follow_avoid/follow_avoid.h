@@ -113,6 +113,8 @@ typedef struct {
     float emergency_distance_m;/* <= this in front cone / ultrasonic -> ESTOP */
     float slow_distance_m;     /* start linearly slowing down */
     float safe_distance_m;     /* a sector closer than this is "blocked" */
+    float side_release_distance_m; /* opposite side must exceed this to exit */
+    float avoid_forward_mps;   /* straight escape speed after the turn */
     float robot_half_width_m;  /* widens blocked sectors to robot's footprint */
     float front_cone_rad;      /* half-angle of the cone used for the governor */
 
@@ -134,6 +136,8 @@ typedef struct {
     float lost_timer_s;        /* time since last valid target */
     float search_timer_s;      /* time spent searching */
     float last_known_bearing;  /* bearing of the target when last seen */
+    float avoidance_direction; /* +1 locked left turn, -1 locked right turn */
+    bool avoidance_active;
     bool has_last_known;
     bool initialized;
 } fa_ctx_t;
