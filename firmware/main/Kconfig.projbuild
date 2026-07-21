@@ -1,0 +1,131 @@
+menu "Algorithm 6 follow vehicle"
+
+comment "ESC parameters are fixed from the hardware-verified reference branch"
+
+config FOLLOW_ROBOT_TICKS_PER_METER
+    int "Encoder 4x ticks per metre (calibrate on the vehicle)"
+    default 2000
+
+config FOLLOW_ROBOT_SPEED_KP
+    int "Wheel speed KP (us per m/s)"
+    default 200
+
+config FOLLOW_ROBOT_SPEED_KI
+    int "Wheel speed KI (us per m/s/s)"
+    default 300
+
+config FOLLOW_ROBOT_SPEED_KD
+    int "Wheel speed KD (us per m/s/s)"
+    default 5
+
+config FOLLOW_ROBOT_SPEED_PID_LIMIT_US
+    int "Maximum PID correction per wheel (us)"
+    default 400
+
+config FOLLOW_ROBOT_TRACK_WIDTH_MM
+    int "Rear wheel track width (mm)"
+    default 300
+
+config FOLLOW_ROBOT_MAX_WHEEL_SPEED_MMPS
+    int "Calibrated maximum wheel speed (mm/s)"
+    default 900
+
+config FOLLOW_ROBOT_FOLLOW_DISTANCE_MM
+    int "Desired UWB target distance (mm)"
+    default 1000
+
+config FOLLOW_ROBOT_STOP_BAND_MM
+    int "Distance hold band (mm)"
+    default 250
+
+config FOLLOW_ROBOT_MAX_LINEAR_MMPS
+    int "Maximum automatic linear speed (mm/s)"
+    default 900
+
+config FOLLOW_ROBOT_MAX_ANGULAR_MRADPS
+    int "Maximum automatic angular speed (mrad/s)"
+    default 1600
+
+config FOLLOW_ROBOT_EMERGENCY_DIST_MM
+    int "Obstacle emergency distance (mm)"
+    default 350
+
+config FOLLOW_ROBOT_SLOW_DIST_MM
+    int "Obstacle slowdown distance (mm)"
+    default 1200
+
+config FOLLOW_ROBOT_SAFE_DIST_MM
+    int "Blocked lidar sector distance (mm)"
+    default 800
+
+config FOLLOW_ROBOT_ROBOT_HALF_WIDTH_MM
+    int "Robot half-width used for obstacle inflation (mm)"
+    default 220
+
+config FOLLOW_ROBOT_LIDAR_FORWARD_DEG
+    int "RPLIDAR raw angle aligned with vehicle forward (degrees)"
+    default 0
+
+config FOLLOW_ROBOT_CONTROL_HZ
+    int "Control loop frequency (Hz)"
+    default 50
+    range 20 100
+
+comment "FSR force sensor calibration"
+
+config FOLLOW_ROBOT_FSR_SAMPLE_COUNT
+    int "ADC oversampling count"
+    default 10
+    range 1 100
+    help
+        Number of ADC readings averaged per FSR sample.
+
+config FOLLOW_ROBOT_FSR_REFERENCE_MV
+    int "ADC reference voltage (mV)"
+    default 3300
+    range 2500 5000
+    help
+        Board ADC reference voltage in millivolts (typ. 3300).
+
+config FOLLOW_ROBOT_FSR_SLOPE_UV_PER_KG
+    int "Calibration slope (µV/kg)"
+    default 400
+    help
+        Voltage change per kg applied force, in µV/kg.
+
+config FOLLOW_ROBOT_FSR_OFFSET_UV
+    int "Calibration offset (µV)"
+    default 74900
+    help
+        Zero-force voltage offset in microvolts.
+
+config FOLLOW_ROBOT_FSR_MIN_KG
+    int "Clamp minimum (kg × 100)"
+    default 0
+    help
+        Minimum reportable weight, stored as kg × 100.
+
+config FOLLOW_ROBOT_FSR_MAX_KG
+    int "Clamp maximum (kg × 100)"
+    default 600
+    help
+        Maximum reportable weight, stored as kg × 100 (600 = 6.00 kg).
+
+comment "Web control safety gate"
+
+config FOLLOW_ROBOT_WEB_AP_SSID
+    string "Control access point SSID"
+    default "Algorithm6-Control"
+
+config FOLLOW_ROBOT_WEB_AP_PASSWORD
+    string "Control access point password (empty means open AP)"
+    default ""
+    help
+        Set this locally with menuconfig. Do not commit a private password.
+
+config FOLLOW_ROBOT_WEB_TIMEOUT_MS
+    int "Heartbeat/command timeout before safe stop (ms)"
+    default 1000
+    range 300 5000
+
+endmenu

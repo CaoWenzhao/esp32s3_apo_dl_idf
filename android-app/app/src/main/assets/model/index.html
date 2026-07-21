@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <style>
+    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;touch-action:none}
+    canvas{display:block;width:100%;height:100%;touch-action:none}
+    #loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#59636e;font:600 15px sans-serif;background:#fff;z-index:2}
+  </style>
+</head>
+<body>
+<div id="loading">3D 模型加载中</div>
+<script src="three.min.js"></script>
+<script>
+(() => {
+  const loading = document.getElementById('loading');
+  try {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xffffff);
+
+    // Fixed 45-degree overhead product view.
+    const camera = new THREE.PerspectiveCamera(31, innerWidth / innerHeight, 0.1, 100);
+    camera.position.set(10.2, 9.4, 10.2);
+    camera.lookAt(0, 0.55, 0);
+
+    const renderer = new THREE.WebGLRenderer({antialias:true, alpha:false, powerPreference:'high-performance'});
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    document.body.appendChild(renderer.domElement);
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0xc7cbd0, 2.5));
+    const key = new THREE.DirectionalLight(0xffffff, 3.2);
+    key.position.set(6, 10, 8);
+    key.castShadow = true;
+    key.shadow.mapSize.set(1024, 1024);
+    key.shadow.camera.left = -7;
+    key.shadow.camera.right = 7;
+    key.shadow.camera.top = 9;
+    key.shadow.camera.bottom = -6;
+    scene.add(key);
+    const fill = new THREE.DirectionalLight(0xe7efff, 1.15);
+    fill.position.set(-6, 4, -5);
+    scene.add(fill);
+
+    const mat = {
+      case: new THREE.MeshStandardMaterial({color:0xb9bec1, metalness:0.63, roughness:0.34}),
+      panel: new THREE.MeshStandardMaterial({color:0xc8cbcd, metalness:0.48, roughness:0.43}),
+      edge: new THREE.MeshStandardMaterial({color:0xe4e6e7, metalness:0.92, roughness:0.17}),
+      hinge: new THREE.MeshStandardMaterial({color:0xd5d7d8, metalness:0.95, roughness:0.2}),
+      black: new THREE.MeshStandardMaterial({color:0x16181a, metalness:0.1, roughness:0.55}),
+      rubber: new THREE.MeshStandardMaterial({color:0x101214, metalness:0, roughness:0.88}),
+      blue: new THREE.MeshStandardMaterial({color:0x075ebc, metalness:0.62, roughness:0.27}),
+      red: new THREE.MeshStandardMaterial({color:0xb51c22, metalness:0.1, roughness:0.42}),
+      darkGlass: new THREE.MeshStandardMaterial({color:0x20262b, metalness:0.25, roughness:0.3})
+    };
+
+    const suitcase = new THREE.Group();
+    scene.add(suitcase);
+
+    function mesh(geometry, material, x, y, z, parent=suitcase) {
+      const item = new THREE.Mesh(geometry, material);
+      item.position.set(x, y, z);
+      item.castShadow = true;
+      item.receiveShadow = true;
+      parent.add(item);
+      return item;
+    }
+    function box(w,h,d,material,x,y,z,parent=suitcase) {
+      return mesh(new THREE.BoxGeometry(w,h,d), material, x,y,z,parent);
+    }
+    function cylinder(r,length,material,x,y,z,axis='y',segments=36,parent=suitcase) {
+      const item = mesh(new THREE.CylinderGeometry(r,r,length,segments), material, x,y,z,parent);
+      if (axis === 'x') item.rotation.z = Math.PI / 2;
+      if (axis === 'z') item.rotation.x = Math.PI / 2;
+      return item;
+    }
+    function bevelBox(w,h,d,r,material,x,y,z,parent=suitcase) {
+      const shape = new THREE.Shape();
+      const left=-w/2, bottom=-h/2;
+      shape.moveTo(left+r,bottom);
+      shape.lineTo(left+w-r,bottom);
+      shape.quadraticCurveTo(left+w,bottom,left+w,bottom+r);
+      shape.lineTo(left+w,bottom+h-r);
+      shape.quadraticCurveTo(left+w,bottom+h,left+w-r,bottom+h);
+      shape.lineTo(left+r,bottom+h);
+      shape.quadraticCurveTo(left,bottom+h,left,bottom+h-r);
+      shape.lineTo(left,bottom+r);
+      shape.quadraticCurveTo(left,bottom,left+r,bottom);
+      const geometry = new THREE.ExtrudeGeometry(shape, {
+        depth:d, bevelEnabled:true, bevelSegments:2, steps:1,
+        bevelSize:Math.min(.045,r*.35), bevelThickness:.045, curveSegments:6
+      });
+      geometry.center();
+      return mesh(geometry,material,x,y,z,parent);
+    }
+
+    // Square aluminum equipment case, matching the photographed prototype.
+    bevelBox(3.55,4.55,2.18,.10,mat.case,0,.02,0);
+    bevelBox(3.28,4.25,.10,.055,mat.panel,0,.02,1.13);
+    bevelBox(3.28,4.25,.08,.055,mat.panel,0,.02,-1.13);
+
+    // Aluminum frame profiles and corner caps.
+    [-1.72,1.72].forEach(x => {
+      box(.11,4.25,.14,mat.edge,x,.02,1.14);
+      box(.11,4.25,.14,mat.edge,x,.02,-1.14);
+      box(.14,4.25,.11,mat.edge,x,.02,0);
+    });
+    [-2.10,2.14].forEach(y => {
+      box(3.34,.11,.14,mat.edge,0,y,1.14);
+      box(3.34,.11,.14,mat.edge,0,y,-1.14);
+      box(3.48,.14,.11,mat.edge,0,y,0);
+    });
+    [-1.72,1.72].forEach(x => [-2.10,2.14].forEach(y => {
+      bevelBox(.38,.38,.30,.055,mat.hinge,x,y,1.13);
+      bevelBox(.38,.38,.25,.055,mat.hinge,x,y,-1.13);
+    }));
+
+    // Front center seam and small identification plate.
+    box(.035,4.02,.025,mat.edge,0,.02,1.205);
+    bevelBox(.72,.12,.035,.025,mat.hinge,0,1.28,1.23);
+
+    // Rear pull handle and black support rails.
+    [-.69,.69].forEach(x => {
+      box(.15,2.70,.15,mat.edge,x,3.42,-.80);
+      box(.23,2.15,.24,mat.black,x,.72,-1.28);
+    });
+    bevelBox(1.68,.34,.34,.11,mat.black,0,4.78,-.80);
+    box(1.66,.25,.27,mat.black,0,1.66,-1.28);
+    box(1.66,.25,.27,mat.black,0,-.30,-1.28);
+
+    // Fold-down top handle.
+    box(1.15,.17,.25,mat.black,0,2.43,-.12);
+    box(.18,.25,.24,mat.black,-.48,2.31,-.12);
+    box(.18,.25,.24,mat.black,.48,2.31,-.12);
+
+    // Hinges, latches, side handle, power switch and ultrasonic sensors.
+    [-.98,.90].forEach(y => bevelBox(.13,.48,.52,.03,mat.hinge,1.82,y,.48));
+    bevelBox(.16,.50,.56,.03,mat.hinge,1.82,.02,.48);
+    box(.13,.87,.20,mat.black,1.83,-.32,-.42);
+    box(.16,.31,.25,mat.red,1.83,-.93,-.20);
+    cylinder(.12,.10,mat.darkGlass,-1.83,.48,.22,'x',24);
+    cylinder(.12,.10,mat.darkGlass,1.83,.48,.22,'x',24);
+
+    // Powered wheels with visible blue hubs.
+    [-1.88,1.88].forEach(x => {
+      cylinder(.56,.28,mat.rubber,x,-1.72,-.44,'x',40);
+      cylinder(.39,.30,mat.blue,x,-1.72,-.44,'x',32);
+      cylinder(.105,.32,mat.hinge,x,-1.72,-.44,'x',24);
+    });
+
+    // Front swivel casters and lidar under the case.
+    [-1.12,1.12].forEach(x => {
+      box(.15,.32,.18,mat.black,x,-2.22,.62);
+      cylinder(.27,.18,mat.rubber,x,-2.43,.70,'x',28);
+      cylinder(.07,.20,mat.hinge,x,-2.43,.70,'x',20);
+    });
+    cylinder(.25,.32,mat.black,0,-2.36,-.02,'y',36);
+    cylinder(.19,.335,mat.darkGlass,0,-2.36,-.02,'y',36);
+
+    // Stationary turntable below the model.
+    const turntable = new THREE.Group();
+    scene.add(turntable);
+    const disk = mesh(new THREE.CylinderGeometry(3.15,3.28,.18,64),
+      new THREE.MeshStandardMaterial({color:0xe8eaec,metalness:.12,roughness:.68}),
+      0,-2.70,0,turntable);
+    disk.castShadow = false;
+    const ring = mesh(new THREE.TorusGeometry(2.82,.035,12,80),
+      new THREE.MeshStandardMaterial({color:0xb8bec4,metalness:.48,roughness:.42}),
+      0,-2.595,0,turntable);
+    ring.rotation.x = Math.PI / 2;
+
+    const floor = new THREE.Mesh(
+      new THREE.CircleGeometry(7.2,64),
+      new THREE.MeshStandardMaterial({color:0xf7f8f9,roughness:1})
+    );
+    floor.rotation.x = -Math.PI/2;
+    floor.position.y = -2.80;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // Horizontal drag only: the camera angle stays fixed and the case rotates on the disk.
+    let targetYaw = 0;
+    let dragging = false;
+    let lastX = 0;
+    let touched = false;
+    renderer.domElement.addEventListener('pointerdown', event => {
+      dragging = true;
+      touched = true;
+      lastX = event.clientX;
+      renderer.domElement.setPointerCapture(event.pointerId);
+    });
+    renderer.domElement.addEventListener('pointermove', event => {
+      if (!dragging) return;
+      targetYaw += (event.clientX - lastX) * .012;
+      lastX = event.clientX;
+    });
+    renderer.domElement.addEventListener('pointerup', () => dragging = false);
+    renderer.domElement.addEventListener('pointercancel', () => dragging = false);
+
+    function resize() {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight, false);
+    }
+    addEventListener('resize', resize);
+
+    const clock = new THREE.Clock();
+    function render() {
+      requestAnimationFrame(render);
+      const dt = Math.min(clock.getDelta(), .04);
+      if (!touched) targetYaw += dt * .035;
+      suitcase.rotation.y += (targetYaw - suitcase.rotation.y) * .10;
+      renderer.render(scene,camera);
+      loading.style.display = 'none';
+    }
+    render();
+  } catch (error) {
+    console.error(error && error.stack ? error.stack : error);
+    loading.textContent = '3D 模型渲染失败，请更新 Android System WebView';
+    loading.style.color = '#b21720';
+  }
+})();
+</script>
+</body>
+</html>
