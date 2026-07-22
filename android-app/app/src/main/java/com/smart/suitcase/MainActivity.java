@@ -16,12 +16,13 @@ import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanResult;
 import android.content.Context;
-import android.content.BroadcastReceiver;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.util.Log;
@@ -78,7 +79,6 @@ public class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private BluetoothAdapter adapter;
     private BluetoothLeScanner scanner;
-    private BluetoothDevice pendingDevice;
     private BluetoothGatt gatt;
     private BluetoothGattCharacteristic commandCharacteristic;
     private boolean scanning;
@@ -87,19 +87,19 @@ public class MainActivity extends Activity {
     private boolean writeBusy;
     private final Queue<byte[]> writeQueue = new ArrayDeque<>();
 
+    private TextView statusDot;
     private TextView connectionText;
     private Button connectButton;
     private Button followButton;
     private Button manualButton;
+    private BatteryIndicator batteryIcon;
     private TextView batteryValue;
-    private TextView batterySub;
     private TextView weightValue;
     private TextView targetDistanceValue;
     private TextView distanceAlert;
     private TextView targetBearingValue;
     private TextView frontValue;
     private TextView sideValue;
-    private TextView stateValue;
     private TextView motionValue;
     private TextView uwbBadge;
     private TextView lidarBadge;
@@ -116,31 +116,6 @@ public class MainActivity extends Activity {
     private final boolean[] sliderTouching = new boolean[3];
     private boolean manualMode;
     private boolean estop = true;
-
-    private final BroadcastReceiver bondReceiver = new BroadcastReceiver() {
-        @SuppressLint("MissingPermission")
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            if (!BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(intent.getAction())) return;
-            BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-            if (device == null || pendingDevice == null ||
-                    !device.getAddress().equals(pendingDevice.getAddress())) return;
-            int state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE);
-            int previous = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE,
-                    BluetoothDevice.BOND_NONE);
-            if (state == BluetoothDevice.BOND_BONDED) {
-                setConnection("配对成功，正在连接…", false);
-                if (gatt != null) {
-                    beginGattSetup(gatt);
-                } else {
-                    connectDevice(device);
-                }
-            } else if (state == BluetoothDevice.BOND_NONE && previous != BluetoothDevice.BOND_NONE) {
-                disconnectGatt();
-                setConnection("已取消配对，设备已恢复广播，点连接重试", false);
-            }
-        }
-    };
 
     private final Runnable scanTimeout = () -> {
         stopScan();
@@ -170,12 +145,6 @@ public class MainActivity extends Activity {
         getWindow().setNavigationBarColor(BG);
         getWindow().getDecorView().setSystemUiVisibility(
                 View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
-        IntentFilter bondFilter = new IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(bondReceiver, bondFilter, Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(bondReceiver, bondFilter);
-        }
         buildUi();
         BluetoothManager manager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
         adapter = manager == null ? null : manager.getAdapter();
@@ -191,6 +160,8 @@ public class MainActivity extends Activity {
         LinearLayout root = vertical();
         root.setPadding(dp(18), dp(18), dp(18), dp(32));
         scroll.addView(root, matchWrap());
+
+        root.addView(new Space(this), matchHeight(dp(56)));
 
         WebView modelView = new WebView(this);
         modelView.setBackgroundColor(Color.WHITE);
@@ -233,10 +204,47 @@ public class MainActivity extends Activity {
         productName.setGravity(Gravity.CENTER);
         root.addView(productName, withMargins(matchHeight(dp(52)), 0, 0, 0, dp(4)));
 
-        LinearLayout header = horizontal();
-        header.setGravity(Gravity.CENTER_VERTICAL);
-        connectionText = text("正在准备蓝牙…", 14, MUTED, false);
-        header.addView(connectionText, new LinearLayout.LayoutParams(0, dp(50), 1));
+        LinearLayout deviceStrip = horizontal();
+        deviceStrip.setGravity(Gravity.CENTER_VERTICAL);
+        deviceStrip.setPadding(dp(12), 0, dp(12), 0);
+        deviceStrip.setBackground(round(PANEL, BORDER, 1));
+
+        LinearLayout statusGroup = horizontal();
+        statusGroup.setGravity(Gravity.CENTER_VERTICAL);
+        statusDot = text("●", 13, RED, true);
+        statusGroup.addView(statusDot, new LinearLayout.LayoutParams(dp(18), dp(54)));
+        connectionText = text("未连接", 14, TEXT, true);
+        statusGroup.addView(connectionText, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(54)));
+        deviceStrip.addView(statusGroup, new LinearLayout.LayoutParams(0, dp(54), 1.25f));
+
+        View divider1 = new View(this);
+        divider1.setBackgroundColor(BORDER);
+        deviceStrip.addView(divider1, new LinearLayout.LayoutParams(dp(1), dp(24)));
+
+        LinearLayout batteryGroup = horizontal();
+        batteryGroup.setGravity(Gravity.CENTER);
+        batteryIcon = new BatteryIndicator(this);
+        LinearLayout.LayoutParams batteryIconLp = new LinearLayout.LayoutParams(dp(29), dp(17));
+        batteryIconLp.setMargins(0, 0, dp(7), 0);
+        batteryGroup.addView(batteryIcon, batteryIconLp);
+        batteryValue = text("100%", 14, TEXT, true);
+        batteryGroup.addView(batteryValue, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(54)));
+        deviceStrip.addView(batteryGroup, new LinearLayout.LayoutParams(0, dp(54), 1.0f));
+
+        View divider2 = new View(this);
+        divider2.setBackgroundColor(BORDER);
+        deviceStrip.addView(divider2, new LinearLayout.LayoutParams(dp(1), dp(24)));
+
+        weightValue = text("-- kg", 14, TEXT, true);
+        weightValue.setGravity(Gravity.CENTER);
+        deviceStrip.addView(weightValue, new LinearLayout.LayoutParams(0, dp(54), .85f));
+        root.addView(deviceStrip, withMargins(matchHeight(dp(56)), 0, 0, 0, dp(7)));
+
+        LinearLayout connectionAction = horizontal();
+        connectionAction.setGravity(Gravity.RIGHT);
+        connectionAction.addView(new Space(this), new LinearLayout.LayoutParams(0, dp(42), 1));
         connectButton = button("连接", BLUE, 15);
         connectButton.setOnClickListener(v -> {
             if (ready || gatt != null) {
@@ -245,8 +253,8 @@ public class MainActivity extends Activity {
                 ensurePermissionsAndScan();
             }
         });
-        header.addView(connectButton, new LinearLayout.LayoutParams(dp(92), dp(46)));
-        root.addView(header, withMargins(matchWrap(), 0, 0, 0, dp(12)));
+        connectionAction.addView(connectButton, new LinearLayout.LayoutParams(dp(92), dp(42)));
+        root.addView(connectionAction, withMargins(matchWrap(), 0, 0, 0, dp(12)));
 
         distanceAlert = text("距离警报", 18, Color.WHITE, true);
         distanceAlert.setGravity(Gravity.CENTER);
@@ -254,31 +262,16 @@ public class MainActivity extends Activity {
         distanceAlert.setVisibility(View.GONE);
         root.addView(distanceAlert, withMargins(matchHeight(dp(58)), 0, 0, 0, dp(12)));
 
-        Button stop = button("紧急停止", RED, 26);
-        stop.setOnClickListener(v -> sendCommand("E"));
-        root.addView(stop, withMargins(matchHeight(dp(92)), 0, 0, 0, dp(12)));
-
         LinearLayout armRow = horizontal();
+        Button stop = button("紧急停止", RED, 17);
+        stop.setOnClickListener(v -> sendCommand("E"));
+        armRow.addView(stop, new LinearLayout.LayoutParams(0, dp(60), 1));
         Button arm = button("解除急停 / ARM", GREEN, 17);
         arm.setOnClickListener(v -> sendCommand("A"));
-        armRow.addView(arm, new LinearLayout.LayoutParams(0, dp(58), 1));
-        stateValue = text("等待连接", 15, MUTED, true);
-        stateValue.setGravity(Gravity.CENTER);
-        stateValue.setBackground(round(PANEL, BORDER, 1));
-        LinearLayout.LayoutParams stateLp = new LinearLayout.LayoutParams(0, dp(58), 1);
-        stateLp.setMargins(dp(10), 0, 0, 0);
-        armRow.addView(stateValue, stateLp);
+        LinearLayout.LayoutParams armLp = new LinearLayout.LayoutParams(0, dp(60), 1);
+        armLp.setMargins(dp(10), 0, 0, 0);
+        armRow.addView(arm, armLp);
         root.addView(armRow, withMargins(matchWrap(), 0, 0, 0, dp(12)));
-
-        LinearLayout metrics1 = horizontal();
-        Metric battery = metric("电池", "--%", "-- V");
-        batteryValue = battery.value;
-        batterySub = battery.sub;
-        Metric weight = metric("重量", "-- kg", "压力传感器");
-        weightValue = weight.value;
-        addHalf(metrics1, battery.view, true);
-        addHalf(metrics1, weight.view, false);
-        root.addView(metrics1, withMargins(matchWrap(), 0, 0, 0, dp(10)));
 
         LinearLayout metrics2 = horizontal();
         Metric distance = metric("目标距离", "-- m", "UWB");
@@ -523,10 +516,8 @@ public class MainActivity extends Activity {
             if (name == null) name = result.getDevice().getName();
             if (DEVICE_NAME.equals(name)) {
                 stopScan();
-                pendingDevice = result.getDevice();
-                setConnection(pendingDevice.getBondState() == BluetoothDevice.BOND_BONDED
-                        ? "已配对，正在连接…" : "正在连接，随后输入配对码 123456", false);
-                connectDevice(pendingDevice);
+                setConnection("已找到 SmartSuitcase，正在直接连接…", false);
+                connectDevice(result.getDevice());
             }
         }
 
@@ -549,13 +540,8 @@ public class MainActivity extends Activity {
         @Override
         public void onConnectionStateChange(BluetoothGatt bluetoothGatt, int status, int newState) {
             if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
-                if (bluetoothGatt.getDevice().getBondState() == BluetoothDevice.BOND_BONDED) {
-                    runOnUiThread(() -> setConnection("已加密连接，正在初始化…", false));
-                    beginGattSetup(bluetoothGatt);
-                } else {
-                    runOnUiThread(() -> setConnection("请输入蓝牙配对码 123456", false));
-                    bluetoothGatt.getDevice().createBond();
-                }
+                runOnUiThread(() -> setConnection("蓝牙已连接，正在初始化…", false));
+                beginGattSetup(bluetoothGatt);
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 runOnUiThread(() -> {
                     ready = false;
@@ -684,18 +670,17 @@ public class MainActivity extends Activity {
             float leftM = decimal(p[12]);
             float rightM = decimal(p[13]);
             float batteryPct = decimal(p[14]);
-            float batteryV = decimal(p[15]);
             float weightKg = decimal(p[16]);
             float measuredV = decimal(p[17]);
             float measuredW = decimal(p[18]);
             int leftUs = integer(p[19]);
             int rightUs = integer(p[20]);
 
-            stateValue.setText(estop ? "急停锁定" : state);
-            stateValue.setTextColor(estop ? Color.rgb(255, 126, 126) : TEXT);
-            batteryValue.setText(String.format(Locale.CHINA, "%.0f%%", batteryPct));
-            batterySub.setText(String.format(Locale.CHINA, "%.2f V", batteryV));
+            int displayedBattery = Math.max(0, Math.min(100, Math.round(batteryPct)));
+            batteryValue.setText(String.format(Locale.CHINA, "%d%%", displayedBattery));
+            batteryIcon.setLevel(displayedBattery);
             weightValue.setText(String.format(Locale.CHINA, "%.1f kg", weightKg));
+            setOperatingMode(state);
             targetDistanceValue.setText(validDistance(targetM) ?
                     String.format(Locale.CHINA, "%.2f m", targetM) : "-- m");
             boolean distanceTooFar = (flags & 1) != 0 && validDistance(targetM) && targetM > 5.0f;
@@ -759,11 +744,41 @@ public class MainActivity extends Activity {
         return Float.parseFloat(value.trim());
     }
 
+    private void setOperatingMode(String rawState) {
+        if (!ready) return;
+        String state = rawState == null ? "" : rawState.trim().toUpperCase(Locale.US);
+        String label;
+        int dotColor = GREEN;
+        if (estop || state.contains("ESTOP")) {
+            label = "急停状态";
+            dotColor = RED;
+        } else if (manualMode || state.contains("MANUAL")) {
+            label = "遥控模式";
+        } else if (state.contains("AVOID") || state.contains("OBSTACLE")) {
+            label = "避障模式";
+        } else if (state.contains("SEARCH")) {
+            label = "搜索模式";
+        } else if (state.contains("FOLLOW") || state.contains("IDLE")) {
+            label = "跟随模式";
+        } else {
+            label = "已连接";
+        }
+        statusDot.setTextColor(dotColor);
+        connectionText.setText(label);
+        connectionText.setTextColor(TEXT);
+    }
+
     private void setConnection(String message, boolean connected) {
-        connectionText.setText(String.format(Locale.CHINA, "%s  %s",
-                connected ? "●" : "○", message));
-        connectionText.setTextColor(connected ? Color.rgb(90, 220, 157) : MUTED);
-        connectButton.setText(connected ? "断开" : "连接");
+        statusDot.setTextColor(connected ? GREEN : RED);
+        connectionText.setText(connected ? "已连接" : "未连接");
+        connectionText.setTextColor(TEXT);
+        if (!connected) {
+            batteryValue.setText("100%");
+            batteryIcon.setLevel(100);
+            weightValue.setText("-- kg");
+        }
+        boolean inProgress = !connected && message != null && message.contains("正在");
+        connectButton.setText(connected ? "断开" : (inProgress ? "连接中" : "连接"));
         connectButton.setBackground(round(connected ? Color.rgb(59, 67, 78) : BLUE, Color.TRANSPARENT, 0));
     }
 
@@ -783,16 +798,13 @@ public class MainActivity extends Activity {
             gatt = null;
         }
         commandCharacteristic = null;
+        if (connectionText != null) setConnection("已断开", false);
     }
 
     @Override
     protected void onDestroy() {
         disconnectGatt();
         handler.removeCallbacksAndMessages(null);
-        try {
-            unregisterReceiver(bondReceiver);
-        } catch (IllegalArgumentException ignored) {
-        }
         super.onDestroy();
     }
 
@@ -911,6 +923,55 @@ public class MainActivity extends Activity {
                                                   int left, int top, int right, int bottom) {
         lp.setMargins(dp(left), dp(top), dp(right), dp(bottom));
         return lp;
+    }
+
+    private static final class BatteryIndicator extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF body = new RectF();
+        private int level = 100;
+
+        BatteryIndicator(Context context) {
+            super(context);
+            setContentDescription("电池电量");
+        }
+
+        void setLevel(int value) {
+            level = Math.max(0, Math.min(100, value));
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            float density = getResources().getDisplayMetrics().density;
+            float stroke = 1.4f * density;
+            float nubWidth = 2.5f * density;
+            float top = stroke;
+            float bottom = getHeight() - stroke;
+            float right = getWidth() - nubWidth - stroke * 1.4f;
+            float radius = 2.2f * density;
+            int color = level <= 20 ? RED : TEXT;
+
+            body.set(stroke, top, right, bottom);
+            paint.setColor(color);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(stroke);
+            canvas.drawRoundRect(body, radius, radius, paint);
+
+            paint.setStyle(Paint.Style.FILL);
+            float nubTop = getHeight() * .34f;
+            float nubBottom = getHeight() * .66f;
+            canvas.drawRoundRect(right + stroke * .65f, nubTop,
+                    getWidth(), nubBottom, density, density, paint);
+
+            float inset = stroke * 2.1f;
+            float fillRight = body.left + inset +
+                    Math.max(0, body.width() - inset * 2f) * (level / 100f);
+            if (fillRight > body.left + inset) {
+                canvas.drawRoundRect(body.left + inset, body.top + inset,
+                        fillRight, body.bottom - inset, density, density, paint);
+            }
+        }
     }
 
     private static final class Metric {

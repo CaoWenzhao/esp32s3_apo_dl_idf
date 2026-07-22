@@ -21,7 +21,7 @@
 
     // Fixed 45-degree overhead product view.
     const camera = new THREE.PerspectiveCamera(31, innerWidth / innerHeight, 0.1, 100);
-    camera.position.set(10.2, 9.4, 10.2);
+    camera.position.set(11.35, 10.45, 11.35);
     camera.lookAt(0, 0.55, 0);
 
     const renderer = new THREE.WebGLRenderer({antialias:true, alpha:false, powerPreference:'high-performance'});
@@ -57,6 +57,7 @@
       rubber: new THREE.MeshStandardMaterial({color:0x101214, metalness:0, roughness:0.88}),
       blue: new THREE.MeshStandardMaterial({color:0x075ebc, metalness:0.62, roughness:0.27}),
       red: new THREE.MeshStandardMaterial({color:0xb51c22, metalness:0.1, roughness:0.42}),
+      seam: new THREE.MeshStandardMaterial({color:0x111315, emissive:0x030404, metalness:0, roughness:0.92}),
       darkGlass: new THREE.MeshStandardMaterial({color:0x20262b, metalness:0.25, roughness:0.3})
     };
 
@@ -107,72 +108,113 @@
 
     // Aluminum frame profiles and corner caps.
     [-1.72,1.72].forEach(x => {
-      box(.11,4.25,.14,mat.edge,x,.02,1.14);
       box(.11,4.25,.14,mat.edge,x,.02,-1.14);
       box(.14,4.25,.11,mat.edge,x,.02,0);
     });
     [-2.10,2.14].forEach(y => {
-      box(3.34,.11,.14,mat.edge,0,y,1.14);
       box(3.34,.11,.14,mat.edge,0,y,-1.14);
       box(3.48,.14,.11,mat.edge,0,y,0);
     });
     [-1.72,1.72].forEach(x => [-2.10,2.14].forEach(y => {
-      bevelBox(.38,.38,.30,.055,mat.hinge,x,y,1.13);
-      bevelBox(.38,.38,.25,.055,mat.hinge,x,y,-1.13);
+      // Compact corner protectors: all three dimensions are about 2/3 size.
+      bevelBox(.25,.25,.20,.037,mat.hinge,x,y,1.13);
+      bevelBox(.25,.25,.17,.037,mat.hinge,x,y,-1.13);
     }));
 
-    // Front center seam and small identification plate.
-    box(.035,4.02,.025,mat.edge,0,.02,1.205);
-    bevelBox(.72,.12,.035,.025,mat.hinge,0,1.28,1.23);
-
-    // Rear pull handle and black support rails.
-    [-.69,.69].forEach(x => {
-      box(.15,2.70,.15,mat.edge,x,3.42,-.80);
-      box(.23,2.15,.24,mat.black,x,.72,-1.28);
+    // Two equal silver rails with a thin black opening seam between them.
+    // The side strips align with the latch centers; the top run is lifted onto
+    // the case surface so the lid boundary remains visible from above.
+    [-1.80,1.80].forEach(x => {
+      box(.08,4.55,.08,mat.edge,x,.02,.92);
+      box(.08,4.55,.04,mat.seam,x,.02,.86);
+      box(.08,4.55,.08,mat.edge,x,.02,.80);
     });
-    bevelBox(1.68,.34,.34,.11,mat.black,0,4.78,-.80);
-    box(1.66,.25,.27,mat.black,0,1.66,-1.28);
-    box(1.66,.25,.27,mat.black,0,-.30,-1.28);
+    box(3.64,.06,.08,mat.edge,0,2.32,.92);
+    box(3.64,.06,.04,mat.seam,0,2.32,.86);
+    box(3.64,.06,.08,mat.edge,0,2.32,.80);
+
+    // Continue the same boundary around the lower edge of the lid.
+    box(3.64,.08,.08,mat.edge,0,-2.10,.92);
+    box(3.64,.08,.04,mat.seam,0,-2.10,.86);
+    box(3.64,.08,.08,mat.edge,0,-2.10,.80);
+
+    // Rear-mounted pull handle. Every moving rail sits behind the rear panel
+    // instead of emerging through the suitcase body.
+    const rearRailZ = -1.38;
+    const rearMountZ = -1.38;
+    [-.69,.69].forEach(x => {
+      box(.15,2.70,.15,mat.edge,x,3.42,rearRailZ);
+      box(.23,2.45,.24,mat.black,x,.84,rearMountZ);
+    });
+    bevelBox(1.68,.34,.34,.11,mat.black,0,4.78,rearRailZ);
+    box(1.66,.25,.27,mat.black,0,1.66,rearMountZ);
+    box(1.66,.25,.27,mat.black,0,-.30,rearMountZ);
 
     // Fold-down top handle.
     box(1.15,.17,.25,mat.black,0,2.43,-.12);
     box(.18,.25,.24,mat.black,-.48,2.31,-.12);
     box(.18,.25,.24,mat.black,.48,2.31,-.12);
 
-    // Hinges, latches, side handle, power switch and ultrasonic sensors.
-    [-.98,.90].forEach(y => bevelBox(.13,.48,.52,.03,mat.hinge,1.82,y,.48));
-    bevelBox(.16,.50,.56,.03,mat.hinge,1.82,.02,.48);
-    box(.13,.87,.20,mat.black,1.83,-.32,-.42);
-    box(.16,.31,.25,mat.red,1.83,-.93,-.20);
-    cylinder(.12,.10,mat.darkGlass,-1.83,.48,.22,'x',24);
-    cylinder(.12,.10,mat.darkGlass,1.83,.48,.22,'x',24);
+    // The +X side carries the two lid latches and the centered side handle.
+    [1.28,-1.38].forEach(y => {
+      box(.16,.43,.66,mat.hinge,1.84,y,.82);
+      bevelBox(.25,.20,.34,.035,mat.hinge,1.95,y,.86);
+      cylinder(.055,.21,mat.black,2.02,y,.92,'x',20);
+    });
+    box(.17,.27,.48,mat.hinge,1.84,.57,.02);
+    box(.17,.27,.48,mat.hinge,1.84,-.57,.02);
+    bevelBox(.18,.78,.25,.06,mat.black,1.96,0,.02);
 
-    // Powered wheels with visible blue hubs.
-    [-1.88,1.88].forEach(x => {
-      cylinder(.56,.28,mat.rubber,x,-1.72,-.44,'x',40);
-      cylinder(.39,.30,mat.blue,x,-1.72,-.44,'x',32);
-      cylinder(.105,.32,mat.hinge,x,-1.72,-.44,'x',24);
+    // The -X side carries the lid hinges and the low-mounted power switch.
+    [1.28,-1.38].forEach(y => {
+      box(.16,.43,.66,mat.hinge,-1.84,y,.82);
+      cylinder(.085,.48,mat.hinge,-1.96,y,.86,'y',24);
+    });
+    box(.15,.43,.38,mat.black,-1.86,-1.08,.02);
+    bevelBox(.11,.27,.25,.025,mat.red,-1.96,-1.08,.02);
+
+    // The power socket is low on the switch side. The two ultrasonic sensors
+    // are represented by vertical black bars near the lower rear corners.
+    cylinder(.105,.11,mat.darkGlass,-1.91,-1.50,-.16,'x',24);
+    [-1.92,1.92].forEach(x => {
+      bevelBox(.13,.48,.18,.035,mat.black,x,-1.44,-.91);
     });
 
-    // Front swivel casters and lidar under the case.
-    [-1.12,1.12].forEach(x => {
-      box(.15,.32,.18,mat.black,x,-2.22,.62);
-      cylinder(.27,.18,mat.rubber,x,-2.43,.70,'x',28);
-      cylinder(.07,.20,mat.hinge,x,-2.43,.70,'x',20);
+    // Each powered wheel is carried by a motor housing and axle below the case.
+    [-1.98,1.98].forEach(x => {
+      const motorX = x < 0 ? -1.68 : 1.68;
+      cylinder(.25,.34,mat.black,motorX,-2.03,.66,'x',32);
+      cylinder(.10,.48,mat.hinge,x,-2.25,.66,'x',24);
+      cylinder(.56,.28,mat.rubber,x,-2.25,.66,'x',40);
+      cylinder(.39,.30,mat.blue,x,-2.25,.66,'x',32);
+      cylinder(.105,.32,mat.hinge,x,-2.25,.66,'x',24);
     });
-    cylinder(.25,.32,mat.black,0,-2.36,-.02,'y',36);
-    cylinder(.19,.335,mat.darkGlass,0,-2.36,-.02,'y',36);
+
+    // Rear swivel casters: a vertical swivel stem feeds a metal U-fork. Two
+    // fork plates clamp each wheel and a visible axle passes through all three.
+    [-1.54,1.54].forEach(x => {
+      cylinder(.10,.18,mat.hinge,x,-2.18,-1.22,'y',24);
+      box(.44,.08,.22,mat.hinge,x,-2.29,-1.22);
+      box(.06,.34,.12,mat.hinge,x-.16,-2.45,-1.22);
+      box(.06,.34,.12,mat.hinge,x+.16,-2.45,-1.22);
+      cylinder(.27,.24,mat.rubber,x,-2.54,-1.22,'x',28);
+      cylinder(.07,.48,mat.hinge,x,-2.54,-1.22,'x',20);
+      cylinder(.10,.035,mat.hinge,x-.25,-2.54,-1.22,'x',20);
+      cylinder(.10,.035,mat.hinge,x+.25,-2.54,-1.22,'x',20);
+    });
+    cylinder(.25,.32,mat.black,0,-2.56,-.02,'y',36);
+    cylinder(.19,.335,mat.darkGlass,0,-2.56,-.02,'y',36);
 
     // Stationary turntable below the model.
     const turntable = new THREE.Group();
     scene.add(turntable);
     const disk = mesh(new THREE.CylinderGeometry(3.15,3.28,.18,64),
       new THREE.MeshStandardMaterial({color:0xe8eaec,metalness:.12,roughness:.68}),
-      0,-2.70,0,turntable);
+      0,-2.90,0,turntable);
     disk.castShadow = false;
     const ring = mesh(new THREE.TorusGeometry(2.82,.035,12,80),
       new THREE.MeshStandardMaterial({color:0xb8bec4,metalness:.48,roughness:.42}),
-      0,-2.595,0,turntable);
+      0,-2.795,0,turntable);
     ring.rotation.x = Math.PI / 2;
 
     const floor = new THREE.Mesh(
@@ -180,7 +222,7 @@
       new THREE.MeshStandardMaterial({color:0xf7f8f9,roughness:1})
     );
     floor.rotation.x = -Math.PI/2;
-    floor.position.y = -2.80;
+    floor.position.y = -3.00;
     floor.receiveShadow = true;
     scene.add(floor);
 
