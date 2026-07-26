@@ -32,6 +32,9 @@
 #define BATTERY_ADC_UNIT              ADC_UNIT_1
 #define BATTERY_ADC_CHANNEL           ADC_CHANNEL_2
 
+#define PIN_IMU_SCL                   GPIO_NUM_41
+#define PIN_IMU_SDA                   GPIO_NUM_42
+
 #define UWB_BAUD_RATE                 115200
 #define RPLIDAR_BAUD_RATE             460800
 #define ULTRASONIC_BAUD_RATE          9600

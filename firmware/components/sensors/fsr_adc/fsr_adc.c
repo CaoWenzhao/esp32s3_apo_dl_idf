@@ -14,10 +14,11 @@ static adc_oneshot_unit_handle_t s_adc_handle;
 static adc_cali_handle_t s_adc_cali_handle;
 static bool s_initialized;
 
-#define BATTERY_DIVIDER_TOP_KOHM     98.6f
-#define BATTERY_DIVIDER_BOTTOM_KOHM  9.84f
+#define BATTERY_ADC_FULL_SCALE_V     1.40f
 #define BATTERY_6S_EMPTY_V           19.8f
-#define BATTERY_6S_FULL_V            25.2f
+#define BATTERY_6S_FULL_V            25.46f
+#define BATTERY_MEASURED_SCALE       \
+    (BATTERY_6S_FULL_V / BATTERY_ADC_FULL_SCALE_V)
 
 static float clampf(float value, float low, float high)
 {
@@ -127,7 +128,14 @@ esp_err_t fsr_adc_read(fsr_adc_reading_t *out)
     }
 
     out->raw = sum / s_config.sample_count;
-    out->voltage_v = fsr_adc_raw_to_voltage(out->raw, s_config.reference_voltage_v);
+    int adc_mv = 0;
+    if (s_adc_cali_handle != NULL &&
+        adc_cali_raw_to_voltage(s_adc_cali_handle, out->raw, &adc_mv) == ESP_OK) {
+        out->voltage_v = (float)adc_mv / 1000.0f;
+    } else {
+        out->voltage_v =
+            fsr_adc_raw_to_voltage(out->raw, s_config.reference_voltage_v);
+    }
     out->weight_kg = fsr_adc_voltage_to_weight_kg(out->voltage_v,
                                                   &s_config.calibration);
     out->valid = true;
@@ -163,9 +171,12 @@ esp_err_t battery_adc_read(battery_adc_reading_t *out)
         adc_mv = (int)((float)out->raw * 3300.0f / 4095.0f + 0.5f);
     }
     out->adc_voltage_v = (float)adc_mv / 1000.0f;
-    out->battery_voltage_v = out->adc_voltage_v *
-        ((BATTERY_DIVIDER_TOP_KOHM + BATTERY_DIVIDER_BOTTOM_KOHM) /
-         BATTERY_DIVIDER_BOTTOM_KOHM);
+    /*
+     * Calibrate against the assembled divider and ADC path: GPIO3 reads
+     * 1.40 V when the 6S battery measures 25.46 V at its terminals.
+     */
+    out->battery_voltage_v =
+        out->adc_voltage_v * BATTERY_MEASURED_SCALE;
     out->percent = clampf((out->battery_voltage_v - BATTERY_6S_EMPTY_V) *
                           100.0f / (BATTERY_6S_FULL_V - BATTERY_6S_EMPTY_V),
                           0.0f, 100.0f);

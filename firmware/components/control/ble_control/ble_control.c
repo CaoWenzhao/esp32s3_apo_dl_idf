@@ -11,7 +11,6 @@
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
 #include "host/ble_uuid.h"
-#include "host/util/util.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "services/gap/ble_svc_gap.h"
@@ -19,9 +18,6 @@
 #include "web_control.h"
 
 static const char *TAG = "ble_control";
-static const uint32_t PAIRING_PASSKEY = 123456;
-
-void ble_store_config_init(void);
 
 /* 5f6d1000-8f3e-4c21-a7b2-3d4e5f607182 */
 static const ble_uuid128_t s_service_uuid =
@@ -167,17 +163,13 @@ static const struct ble_gatt_svc_def s_services[] = {
                 .uuid = &s_command_uuid.u,
                 .access_cb = command_access,
                 .val_handle = &s_command_handle,
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP |
-                         BLE_GATT_CHR_F_WRITE_ENC | BLE_GATT_CHR_F_WRITE_AUTHEN,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
             },
             {
                 .uuid = &s_telemetry_uuid.u,
                 .access_cb = telemetry_access,
                 .val_handle = &s_telemetry_handle,
-                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY |
-                         BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_READ_AUTHEN |
-                         BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC |
-                         BLE_GATT_CHR_F_NOTIFY_INDICATE_AUTHEN,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
             },
             {0},
         },
@@ -228,8 +220,6 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status == 0) {
             s_connection_handle = event->connect.conn_handle;
             ESP_LOGI(TAG, "phone connected handle=%u", s_connection_handle);
-            const int security_rc = ble_gap_security_initiate(s_connection_handle);
-            ESP_LOGI(TAG, "pairing/security requested rc=%d", security_rc);
         } else {
             advertise();
         }
@@ -252,35 +242,6 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "MTU=%u", event->mtu.value);
         return 0;
-    case BLE_GAP_EVENT_PASSKEY_ACTION: {
-        struct ble_sm_io io = {0};
-        if (event->passkey.params.action != BLE_SM_IOACT_DISP) {
-            ESP_LOGW(TAG, "unexpected passkey action=%u",
-                     event->passkey.params.action);
-            return BLE_HS_EINVAL;
-        }
-        io.action = BLE_SM_IOACT_DISP;
-        io.passkey = PAIRING_PASSKEY;
-        const int rc = ble_sm_inject_io(event->passkey.conn_handle, &io);
-        ESP_LOGI(TAG, "pairing passkey ready, rc=%d", rc);
-        return rc;
-    }
-    case BLE_GAP_EVENT_ENC_CHANGE:
-        ESP_LOGI(TAG, "encryption changed status=%d", event->enc_change.status);
-        if (event->enc_change.status != 0) {
-            const int rc = ble_gap_terminate(event->enc_change.conn_handle,
-                                             BLE_ERR_REM_USER_CONN_TERM);
-            ESP_LOGW(TAG, "pairing failed/cancelled; disconnecting handle=%u rc=%d",
-                     event->enc_change.conn_handle, rc);
-        }
-        return 0;
-    case BLE_GAP_EVENT_REPEAT_PAIRING: {
-        struct ble_gap_conn_desc desc;
-        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
-            ble_store_util_delete_peer(&desc.peer_id_addr);
-        }
-        return BLE_GAP_REPEAT_PAIRING_RETRY;
-    }
     default:
         return 0;
     }
@@ -340,13 +301,12 @@ esp_err_t ble_control_init(void)
     }
     ble_hs_cfg.reset_cb = on_reset;
     ble_hs_cfg.sync_cb = on_sync;
-    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
-    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_DISP_ONLY;
-    ble_hs_cfg.sm_bonding = 1;
-    ble_hs_cfg.sm_mitm = 1;
-    ble_hs_cfg.sm_sc = 1;
-    ble_hs_cfg.sm_our_key_dist |= BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
-    ble_hs_cfg.sm_their_key_dist |= BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_bonding = 0;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_sc = 0;
+    ble_hs_cfg.sm_our_key_dist = 0;
+    ble_hs_cfg.sm_their_key_dist = 0;
     ble_svc_gap_init();
     ble_svc_gatt_init();
     int rc = ble_gatts_count_cfg(s_services);
@@ -363,7 +323,6 @@ esp_err_t ble_control_init(void)
         ESP_LOGE(TAG, "GATT initialization failed: %d", rc);
         return ESP_FAIL;
     }
-    ble_store_config_init();
     nimble_port_freertos_init(host_task);
     if (xTaskCreate(telemetry_task, "ble_telemetry", 4096, NULL, 4, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;

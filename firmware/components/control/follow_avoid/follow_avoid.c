@@ -60,9 +60,9 @@ fa_config_t fa_default_config(void)
 
     c.max_linear_mps = 0.9f;
     c.max_angular_rps = 1.6f;
-    c.max_lin_accel_mps2 = 2.4f;
-    c.max_lin_decel_mps2 = 3.0f;   /* brake faster than we accelerate */
-    c.max_ang_accel_rps2 = 22.0f;
+    c.max_lin_accel_mps2 = 1.2f;
+    c.max_lin_decel_mps2 = 1.4f;
+    c.max_ang_accel_rps2 = 10.0f;
 
     c.kp_dist = 1.215f;
     c.kp_bear = 1.76f;
@@ -382,15 +382,16 @@ fa_output_t fa_update(fa_ctx_t *ctx, const fa_target_t *target,
                                            : ctx->last_known_bearing;
 
         if (lidar_blocked) {
-            /* Turning is always allowed, even at zero front clearance. Stop
-             * forward motion immediately and pivot in the locked direction. */
-            ctx->cmd_v = 0.0f;
+            /* Turning is always allowed, even at zero front clearance. Ramp
+             * forward motion down before pivoting to avoid an ESC step. */
+            ctx->cmd_v = ramp(ctx->cmd_v, 0.0f,
+                              cfg->max_lin_decel_mps2, dt_s);
             ctx->cmd_w = ramp(ctx->cmd_w,
                               ctx->avoidance_direction * cfg->max_angular_rps,
                               cfg->max_ang_accel_rps2, dt_s);
             ctx->prev_heading = ctx->avoidance_direction *
                                 (float)(55.0 * M_PI / 180.0);
-            out.v_mps = 0.0f;
+            out.v_mps = ctx->cmd_v;
             out.omega_rps = ctx->cmd_w;
             out.chosen_heading_rad = ctx->prev_heading;
             return out;

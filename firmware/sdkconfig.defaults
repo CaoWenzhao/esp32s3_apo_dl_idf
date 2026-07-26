@@ -21,6 +21,6 @@ CONFIG_BT_NIMBLE_MAX_BONDS=3
 
 # The installed ESP32-S3 modules have 16 MB flash. BLE pushes the application
 # beyond the original 1 MB factory partition.
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

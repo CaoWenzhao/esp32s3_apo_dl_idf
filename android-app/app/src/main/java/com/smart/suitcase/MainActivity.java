@@ -85,6 +85,7 @@ public class MainActivity extends Activity {
     private boolean ready;
     private boolean setupStarted;
     private boolean writeBusy;
+    private boolean manualDisconnect;
     private final Queue<byte[]> writeQueue = new ArrayDeque<>();
 
     private TextView statusDot;
@@ -119,7 +120,10 @@ public class MainActivity extends Activity {
 
     private final Runnable scanTimeout = () -> {
         stopScan();
-        setConnection("未找到设备，点此重试", false);
+        setConnection("未找到设备，正在重试", false);
+        if (!manualDisconnect) {
+            handler.postDelayed(this::ensurePermissionsAndScan, 1000);
+        }
     };
 
     private final Runnable heartbeat = new Runnable() {
@@ -248,8 +252,10 @@ public class MainActivity extends Activity {
         connectButton = button("连接", BLUE, 15);
         connectButton.setOnClickListener(v -> {
             if (ready || gatt != null) {
+                manualDisconnect = true;
                 disconnectGatt();
             } else {
+                manualDisconnect = false;
                 ensurePermissionsAndScan();
             }
         });
@@ -488,6 +494,7 @@ public class MainActivity extends Activity {
             setConnection("请打开蓝牙后点连接", false);
             return;
         }
+        manualDisconnect = false;
         disconnectGatt();
         scanner = adapter.getBluetoothLeScanner();
         if (scanner == null) {
@@ -547,7 +554,10 @@ public class MainActivity extends Activity {
                     ready = false;
                     setupStarted = false;
                     handler.removeCallbacks(heartbeat);
-                    setConnection("蓝牙已断开，点此重连", false);
+                    setConnection(manualDisconnect ? "蓝牙已断开" : "蓝牙已断开，正在重连", false);
+                    if (!manualDisconnect) {
+                        handler.postDelayed(MainActivity.this::ensurePermissionsAndScan, 700);
+                    }
                 });
                 bluetoothGatt.close();
                 if (gatt == bluetoothGatt) gatt = null;
@@ -803,6 +813,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        manualDisconnect = true;
         disconnectGatt();
         handler.removeCallbacksAndMessages(null);
         super.onDestroy();

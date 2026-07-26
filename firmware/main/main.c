@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "sdkconfig.h"
@@ -42,8 +43,12 @@ static const char *TAG = "algorithm6";
 #define UWB_JUMP_MARGIN_M 1.00f
 #define UWB_REINIT_OUTLIERS 1
 #define SUITCASE_BASE_WEIGHT_KG 10.2f
-#define PRESSURE_ZERO_RAW_THRESHOLD 24
-#define PRESSURE_KG_PER_VOLT 10.0f
+#define PRESSURE_DIVIDER_KOHM 8.67f
+#define PRESSURE_EXCITATION_V 3.3f
+#define PRESSURE_NO_LOAD_KOHM 500.0f
+#define PRESSURE_CONDUCTANCE_SLOPE 0.0019f
+#define PRESSURE_CONDUCTANCE_OFFSET (-0.0008f)
+#define PRESSURE_MAX_KG 100.0f
 #define LIDAR_TELEMETRY_MAX_M 12.0f
 #define LIDAR_MOTOR_RPM 600
 
@@ -118,6 +123,65 @@ static float clampf_local(float value, float minimum, float maximum)
     if (value < minimum) return minimum;
     if (value > maximum) return maximum;
     return value;
+}
+
+static bool imu_i2c_scan_bus(int sda_gpio, int scl_gpio, const char *label)
+{
+    const gpio_config_t pin_config = {
+        .pin_bit_mask = (1ULL << sda_gpio) | (1ULL << scl_gpio),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&pin_config);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    const int sda_level = gpio_get_level(sda_gpio);
+    const int scl_level = gpio_get_level(scl_gpio);
+    ESP_LOGI("imu_scan", "%s SDA=GPIO%d level=%d, SCL=GPIO%d level=%d",
+             label, sda_gpio, sda_level, scl_gpio, scl_level);
+    if (!sda_level || !scl_level) {
+        ESP_LOGW("imu_scan", "%s bus held low; check power, GND and wiring",
+                 label);
+        return false;
+    }
+
+    const i2c_master_bus_config_t config = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = sda_gpio,
+        .scl_io_num = scl_gpio,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    i2c_master_bus_handle_t bus = NULL;
+    esp_err_t ret = i2c_new_master_bus(&config, &bus);
+    if (ret != ESP_OK) {
+        ESP_LOGE("imu_scan", "%s I2C init failed: %s", label,
+                 esp_err_to_name(ret));
+        return false;
+    }
+
+    unsigned found = 0;
+    for (uint8_t address = 0x08; address <= 0x77; ++address) {
+        if (i2c_master_probe(bus, address, 20) == ESP_OK) {
+            ESP_LOGI("imu_scan", "%s device found at 0x%02X", label,
+                     address);
+            found++;
+        }
+    }
+    i2c_del_master_bus(bus);
+    return found > 0;
+}
+
+static void imu_i2c_scan(void)
+{
+    if (imu_i2c_scan_bus(PIN_IMU_SDA, PIN_IMU_SCL, "reserved wiring")) {
+        return;
+    }
+    if (!imu_i2c_scan_bus(PIN_IMU_SCL, PIN_IMU_SDA, "SDA/SCL swapped")) {
+        ESP_LOGW("imu_scan", "no communicating IMU found on GPIO41/42");
+    }
 }
 
 static void uwb_task(void *argument)
@@ -201,6 +265,38 @@ static float lidar_body_angle_rad(float raw_degrees)
     return DEG_TO_RAD(relative);
 }
 
+static float pressure_resistance_kohm(float voltage_v)
+{
+    if (voltage_v <= 0.0f) {
+        return INFINITY;
+    }
+    if (voltage_v >= PRESSURE_EXCITATION_V) {
+        return 0.0f;
+    }
+    return PRESSURE_DIVIDER_KOHM *
+           (PRESSURE_EXCITATION_V / voltage_v - 1.0f);
+}
+
+static float pressure_force_kg(float resistance_kohm)
+{
+    if (!isfinite(resistance_kohm) ||
+        resistance_kohm >= PRESSURE_NO_LOAD_KOHM) {
+        return 0.0f;
+    }
+    if (resistance_kohm <= 0.0f) {
+        return PRESSURE_MAX_KG;
+    }
+
+    const float conductance_per_kohm = 1.0f / resistance_kohm;
+    float force_kg =
+        (conductance_per_kohm - PRESSURE_CONDUCTANCE_OFFSET) /
+        PRESSURE_CONDUCTANCE_SLOPE;
+    if (force_kg < 2.0f) {
+        return 0.0f;
+    }
+    return fminf(force_kg, PRESSURE_MAX_KG);
+}
+
 static void lidar_task(void *argument)
 {
     rplidar_c1_t *lidar = (rplidar_c1_t *)argument;
@@ -274,6 +370,7 @@ static void ultrasonic_task(void *argument)
 static void fsr_task(void *argument)
 {
     (void)argument;
+    unsigned pressure_log_divider = 0;
     while (true) {
         fsr_adc_reading_t reading = {0};
         battery_adc_reading_t battery = {0};
@@ -284,15 +381,21 @@ static void fsr_task(void *argument)
             sensors_lock();
             const uint64_t timestamp_us = now_us();
             if (fsr_ret == ESP_OK && reading.valid) {
+                const float resistance_kohm =
+                    pressure_resistance_kohm(reading.voltage_v);
+                const float force_kg = pressure_force_kg(resistance_kohm);
                 s_sensors.fsr_raw = reading.raw;
                 s_sensors.fsr_voltage_v = reading.voltage_v;
-                const float extra_weight_kg =
-                    reading.raw <= PRESSURE_ZERO_RAW_THRESHOLD
-                        ? 0.0f
-                        : reading.voltage_v * PRESSURE_KG_PER_VOLT;
-                s_sensors.fsr_weight_kg = SUITCASE_BASE_WEIGHT_KG +
-                                          extra_weight_kg;
+                s_sensors.fsr_weight_kg =
+                    SUITCASE_BASE_WEIGHT_KG + force_kg;
                 s_sensors.fsr_timestamp_us = timestamp_us;
+                if (++pressure_log_divider >= 2U) {
+                    pressure_log_divider = 0;
+                    ESP_LOGI("pressure",
+                             "force=%.2fkg total=%.2fkg raw=%d adc=%.3fV sensor_R=%.1fkOhm",
+                             force_kg, s_sensors.fsr_weight_kg, reading.raw,
+                             reading.voltage_v, resistance_kohm);
+                }
             }
             if (battery_ret == ESP_OK && battery.valid) {
                 s_sensors.battery_raw = battery.raw;
@@ -328,43 +431,6 @@ static fa_config_t follow_config(void)
     return config;
 }
 
-static int wheel_speed_to_pulse_us(float wheel_mps, const chassis_config_t *cfg,
-                                   bool invert)
-{
-    if (invert) wheel_mps = -wheel_mps;
-    wheel_mps = clampf_local(wheel_mps, -cfg->max_speed_mps,
-                             cfg->max_speed_mps);
-    float pulse = (float)cfg->esc_mid_us;
-    if (wheel_mps >= 0.0f) {
-        pulse += wheel_mps / cfg->max_speed_mps *
-                 (float)(cfg->esc_max_us - cfg->esc_mid_us);
-    } else {
-        pulse += wheel_mps / cfg->max_speed_mps *
-                 (float)(cfg->esc_mid_us - cfg->esc_min_us);
-    }
-    return (int)lroundf(clampf_local(pulse, (float)cfg->esc_min_us,
-                                     (float)cfg->esc_max_us));
-}
-
-static esp_err_t set_direct_velocity(chassis_t *chassis, float v_mps,
-                                     float omega_rps)
-{
-    const chassis_config_t *cfg = &chassis->cfg;
-    const float half_track = 0.5f * cfg->track_width_m;
-    float left_mps = v_mps - omega_rps * half_track;
-    float right_mps = v_mps + omega_rps * half_track;
-    const float peak = fmaxf(fabsf(left_mps), fabsf(right_mps));
-    if (peak > cfg->max_speed_mps && peak > 0.0f) {
-        const float scale = cfg->max_speed_mps / peak;
-        left_mps *= scale;
-        right_mps *= scale;
-    }
-    return chassis_set_pulse_us(
-        chassis,
-        wheel_speed_to_pulse_us(left_mps, cfg, cfg->left_invert),
-        wheel_speed_to_pulse_us(right_mps, cfg, cfg->right_invert));
-}
-
 static float telemetry_clearance(float distance_m)
 {
     return distance_m >= FA_NO_OBSTACLE * 0.5f
@@ -387,6 +453,7 @@ static chassis_config_t chassis_config(void)
     config.kd = (float)CONFIG_FOLLOW_ROBOT_SPEED_KD;
     config.pid_out_limit_us = (float)CONFIG_FOLLOW_ROBOT_SPEED_PID_LIMIT_US;
     config.encoder_stall_timeout_s = 0.0f;
+    config.slew_us_per_s = 900.0f;
     return config;
 }
 
@@ -498,29 +565,30 @@ static void control_task(void *argument)
         web_control_get_command(&web_command);
         fa_output_t output = {0};
         esp_err_t command_ret;
-        bool direct_follow_control = false;
         const char *state_name;
-        if (web_command.estop_latched || !web_command.client_alive) {
+        if (web_command.estop_latched) {
             command_ret = chassis_emergency_stop(chassis);
-            state_name = web_command.estop_latched ? "WEB_ESTOP" : "WEB_TIMEOUT";
+            state_name = "WEB_ESTOP";
         } else if (web_command.mode == WEB_CONTROL_MODE_MANUAL) {
-            command_ret = chassis_set_velocity(chassis,
-                                               web_command.manual_linear_mps,
-                                               web_command.manual_angular_rps);
-            state_name = "MANUAL";
+            if (web_command.client_alive) {
+                command_ret = chassis_set_velocity(
+                    chassis, web_command.manual_linear_mps,
+                    web_command.manual_angular_rps);
+                state_name = "MANUAL";
+            } else {
+                command_ret = chassis_set_velocity(chassis, 0.0f, 0.0f);
+                state_name = "MANUAL_TIMEOUT";
+            }
         } else {
             output = fa_update(&follow, &target, have_field ? &field : NULL,
                                &ultrasonic_left, &ultrasonic_right, dt);
             output.v_mps *= (float)web_command.follow_speed_pct / 100.0f;
             output.omega_rps *= (float)web_command.follow_turn_pct / 100.0f;
-            command_ret = set_direct_velocity(chassis, output.v_mps,
-                                              output.omega_rps);
-            direct_follow_control = true;
+            command_ret = chassis_set_velocity(chassis, output.v_mps,
+                                               output.omega_rps);
             state_name = follow_state_name(output.state);
         }
-        esp_err_t update_ret = direct_follow_control
-                                   ? ESP_OK
-                                   : chassis_update(chassis, dt);
+        esp_err_t update_ret = chassis_update(chassis, dt);
         if (command_ret != ESP_OK || update_ret != ESP_OK) {
             esp_err_t stop_ret = chassis_emergency_stop(chassis);
             ESP_LOGE(TAG, "chassis command=%s update=%s emergency=%s",
@@ -564,11 +632,13 @@ static void control_task(void *argument)
 
         if (++log_counter >= (unsigned)CONFIG_FOLLOW_ROBOT_CONTROL_HZ) {
             log_counter = 0;
-            ESP_LOGI(TAG, "%s target=%d d=%.2f bearing=%+.2f cmd=%+.2f/%+.2f pulses=%d/%d | lidar=%d ultra=%d/%d frames=%lu/%lu rmt_evt=%lu/%lu sym=%u/%u bytes=%lu/%lu front=%.2f left=%.2f right=%.2f heading=%+.1fdeg",
+            ESP_LOGI(TAG, "%s target=%d d=%.2f bearing=%+.2f cmd=%+.2f/%+.2f pulses=%d/%d | lidar=%d ultra=%d/%d fsr=%d raw=%d adc=%.3fV weight=%.2fkg frames=%lu/%lu rmt_evt=%lu/%lu sym=%u/%u bytes=%lu/%lu front=%.2f left=%.2f right=%.2f heading=%+.1fdeg",
                      state_name, target.valid, target.distance_m,
                      target.bearing_rad, output.v_mps, output.omega_rps,
                      telemetry.left_pulse_us, telemetry.right_pulse_us,
                      have_field, ultrasonic_left.valid, ultrasonic_right.valid,
+                     telemetry.fsr_ok, telemetry.fsr_raw,
+                     telemetry.fsr_voltage_v, telemetry.fsr_weight_kg,
                      (unsigned long)ultrasonic_left_frames,
                      (unsigned long)ultrasonic_right_frames,
                      (unsigned long)s_ultrasonic_left.sw_uart.rx_events,
@@ -608,7 +678,8 @@ static bool start_task_on_core(TaskFunction_t function, const char *name,
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Follow control starting: filtered UWB + lidar clearance + direct ESC output");
+    ESP_LOGI(TAG, "Follow control starting: filtered UWB + lidar clearance + slew-limited ESC output");
+    imu_i2c_scan();
     memset(&s_sensors, 0, sizeof(s_sensors));
     s_sensors.lock = xSemaphoreCreateMutex();
     if (s_sensors.lock == NULL) {

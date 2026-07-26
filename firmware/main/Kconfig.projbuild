@@ -32,7 +32,7 @@ config FOLLOW_ROBOT_MAX_WHEEL_SPEED_MMPS
 
 config FOLLOW_ROBOT_FOLLOW_DISTANCE_MM
     int "Desired UWB target distance (mm)"
-    default 1000
+    default 1400
 
 config FOLLOW_ROBOT_STOP_BAND_MM
     int "Distance hold band (mm)"
