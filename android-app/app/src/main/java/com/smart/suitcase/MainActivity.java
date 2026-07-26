@@ -331,8 +331,16 @@ public class MainActivity extends Activity {
         followButton = button("跟随模式", BLUE_DARK, 18);
         manualButton = button("遥控模式", CONTROL, 18);
         manualButton.setTextColor(TEXT);
-        followButton.setOnClickListener(v -> sendCommand("M,0"));
-        manualButton.setOnClickListener(v -> sendCommand("M,1"));
+        followButton.setOnClickListener(v -> {
+            manualMode = false;
+            setModeStyle();
+            sendCommand("M,0");
+        });
+        manualButton.setOnClickListener(v -> {
+            manualMode = true;
+            setModeStyle();
+            sendCommand("M,1");
+        });
         addHalf(modes, followButton, true);
         addHalf(modes, manualButton, false);
         modePanel.addView(modes, matchHeight(dp(62)));
@@ -444,7 +452,12 @@ public class MainActivity extends Activity {
         button.setOnLongClickListener(v -> true);
         button.setOnTouchListener((v, event) -> {
             if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                if (!manualMode) sendCommand("M,1");
+                if (!manualMode) {
+                    manualMode = true;
+                    setModeStyle();
+                    sendCommand("M,1");
+                }
+                button.setBackground(round(BLUE_DARK, Color.TRANSPARENT, 0));
                 sendCommand(String.format(Locale.US, "D,%d,%d", linear, angular));
                 v.setPressed(true);
                 return true;
@@ -452,6 +465,7 @@ public class MainActivity extends Activity {
             if (event.getActionMasked() == MotionEvent.ACTION_UP ||
                     event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
                 sendCommand("D,0,0");
+                button.setBackground(round(color, Color.TRANSPARENT, 0));
                 v.setPressed(false);
                 v.performClick();
                 return true;

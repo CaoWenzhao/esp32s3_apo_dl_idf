@@ -3,14 +3,14 @@ plugins {
 }
 
 android {
-    namespace 'com.smart.suitcase'
+    namespace 'com.smart.suitcase.oppowatch'
     compileSdk 35
 
     defaultConfig {
-        applicationId 'com.smart.suitcase'
+        applicationId 'com.smart.suitcase.oppowatch'
         minSdk 26
         targetSdk 35
-        versionCode 6
+        versionCode 8
         versionName '2.1'
     }
 
@@ -26,7 +26,6 @@ android {
     }
 
     lint {
-        // The requested brand icon intentionally uses a full black square field.
         disable 'IconLauncherShape'
     }
 }
