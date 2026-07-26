@@ -1,4 +1,4 @@
-/* UWB follow vehicle with lidar avoidance and web/manual control. */
+/* UWB follow vehicle with lidar avoidance and BLE/manual control. */
 
 #include <math.h>
 #include <stdbool.h>
@@ -13,6 +13,7 @@
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs_flash.h"
 #include "sdkconfig.h"
 
 #include "a02yyuw.h"
@@ -568,7 +569,7 @@ static void control_task(void *argument)
         const char *state_name;
         if (web_command.estop_latched) {
             command_ret = chassis_emergency_stop(chassis);
-            state_name = "WEB_ESTOP";
+            state_name = "BLE_ESTOP";
         } else if (web_command.mode == WEB_CONTROL_MODE_MANUAL) {
             if (web_command.client_alive) {
                 command_ret = chassis_set_velocity(
@@ -679,6 +680,17 @@ static bool start_task_on_core(TaskFunction_t function, const char *name,
 void app_main(void)
 {
     ESP_LOGI(TAG, "Follow control starting: filtered UWB + lidar clearance + slew-limited ESC output");
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Bluetooth NVS init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
     imu_i2c_scan();
     memset(&s_sensors, 0, sizeof(s_sensors));
     s_sensors.lock = xSemaphoreCreateMutex();
@@ -689,7 +701,7 @@ void app_main(void)
     fa_obstacle_reset(&s_sensors.field, LIDAR_SECTORS, LIDAR_FOV_RAD);
 
     chassis_config_t drive = chassis_config();
-    esp_err_t ret = chassis_init(&s_chassis, &drive);
+    ret = chassis_init(&s_chassis, &drive);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "chassis init failed: %s", esp_err_to_name(ret));
         return;
@@ -831,12 +843,10 @@ skip_lidar:;
     }
 
     web_control_config_t web = web_control_default_config();
-    web.ap_ssid = CONFIG_FOLLOW_ROBOT_WEB_AP_SSID;
-    web.ap_password = CONFIG_FOLLOW_ROBOT_WEB_AP_PASSWORD;
-    web.command_timeout_ms = CONFIG_FOLLOW_ROBOT_WEB_TIMEOUT_MS;
+    web.command_timeout_ms = CONFIG_FOLLOW_ROBOT_CONTROL_TIMEOUT_MS;
     ret = web_control_init(&web);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "web control init failed: %s; motion remains stopped",
+        ESP_LOGE(TAG, "control state init failed: %s; motion remains stopped",
                  esp_err_to_name(ret));
     }
 

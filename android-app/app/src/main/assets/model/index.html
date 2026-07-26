@@ -3,10 +3,17 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <script>
+    if (new URLSearchParams(location.search).get('theme') === 'dark') {
+      document.documentElement.classList.add('dark');
+    }
+  </script>
   <style>
     html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff;touch-action:none}
     canvas{display:block;width:100%;height:100%;touch-action:none}
     #loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#59636e;font:600 15px sans-serif;background:#fff;z-index:2}
+    html.dark,html.dark body{background:#0f1115}
+    html.dark #loading{color:#a7b0bc;background:#0f1115}
   </style>
 </head>
 <body>
@@ -15,17 +22,29 @@
 <script>
 (() => {
   const loading = document.getElementById('loading');
+  const darkMode = document.documentElement.classList.contains('dark');
   try {
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xffffff);
+    scene.background = new THREE.Color(darkMode ? 0x0f1115 : 0xffffff);
 
     // Fixed 45-degree overhead product view.
     const camera = new THREE.PerspectiveCamera(31, innerWidth / innerHeight, 0.1, 100);
     camera.position.set(11.35, 10.45, 11.35);
     camera.lookAt(0, 0.55, 0);
 
-    const renderer = new THREE.WebGLRenderer({antialias:true, alpha:false, powerPreference:'high-performance'});
-    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({
+        antialias:true, alpha:false, powerPreference:'high-performance'
+      });
+    } catch (primaryError) {
+      console.warn('High-performance WebGL unavailable, using compatibility mode', primaryError);
+      renderer = new THREE.WebGLRenderer({
+        antialias:false, alpha:false, powerPreference:'default',
+        precision:'mediump'
+      });
+    }
+    renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 1.5));
     renderer.setSize(innerWidth, innerHeight);
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -33,12 +52,19 @@
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.0;
     document.body.appendChild(renderer.domElement);
+    renderer.domElement.addEventListener('webglcontextlost', event => {
+      event.preventDefault();
+      renderer.domElement.dataset.modelReady = '0';
+      loading.textContent = '3D 模型正在恢复';
+      loading.style.display = 'flex';
+      setTimeout(() => location.reload(), 300);
+    });
 
     scene.add(new THREE.HemisphereLight(0xffffff, 0xc7cbd0, 2.5));
     const key = new THREE.DirectionalLight(0xffffff, 3.2);
     key.position.set(6, 10, 8);
     key.castShadow = true;
-    key.shadow.mapSize.set(1024, 1024);
+    key.shadow.mapSize.set(512, 512);
     key.shadow.camera.left = -7;
     key.shadow.camera.right = 7;
     key.shadow.camera.top = 9;
@@ -209,17 +235,21 @@
     const turntable = new THREE.Group();
     scene.add(turntable);
     const disk = mesh(new THREE.CylinderGeometry(3.15,3.28,.18,64),
-      new THREE.MeshStandardMaterial({color:0xe8eaec,metalness:.12,roughness:.68}),
+      new THREE.MeshStandardMaterial({
+        color:darkMode ? 0x242a31 : 0xe8eaec,metalness:.12,roughness:.68
+      }),
       0,-2.90,0,turntable);
     disk.castShadow = false;
     const ring = mesh(new THREE.TorusGeometry(2.82,.035,12,80),
-      new THREE.MeshStandardMaterial({color:0xb8bec4,metalness:.48,roughness:.42}),
+      new THREE.MeshStandardMaterial({
+        color:darkMode ? 0x59636f : 0xb8bec4,metalness:.48,roughness:.42
+      }),
       0,-2.795,0,turntable);
     ring.rotation.x = Math.PI / 2;
 
     const floor = new THREE.Mesh(
       new THREE.CircleGeometry(7.2,64),
-      new THREE.MeshStandardMaterial({color:0xf7f8f9,roughness:1})
+      new THREE.MeshStandardMaterial({color:darkMode ? 0x15191f : 0xf7f8f9,roughness:1})
     );
     floor.rotation.x = -Math.PI/2;
     floor.position.y = -3.00;
@@ -245,21 +275,41 @@
     renderer.domElement.addEventListener('pointerup', () => dragging = false);
     renderer.domElement.addEventListener('pointercancel', () => dragging = false);
 
+    const frameBounds = new THREE.Box3().setFromObject(suitcase);
+    frameBounds.union(new THREE.Box3().setFromObject(turntable));
+    const frameCenter = frameBounds.getCenter(new THREE.Vector3());
+    const frameSize = frameBounds.getSize(new THREE.Vector3());
+    const viewDirection = new THREE.Vector3(1, .92, 1).normalize();
+
     function resize() {
       camera.aspect = innerWidth / innerHeight;
+      const verticalFov = THREE.MathUtils.degToRad(camera.fov);
+      const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect);
+      const verticalDistance = frameSize.y / (2 * Math.tan(verticalFov / 2));
+      const horizontalDistance = Math.max(frameSize.x, frameSize.z) /
+        (2 * Math.tan(horizontalFov / 2));
+      const distance = Math.max(verticalDistance, horizontalDistance) * 1.12;
+      camera.position.copy(frameCenter).addScaledVector(viewDirection, distance);
+      camera.lookAt(frameCenter);
       camera.updateProjectionMatrix();
       renderer.setSize(innerWidth, innerHeight, false);
     }
     addEventListener('resize', resize);
+    resize();
 
     const clock = new THREE.Clock();
+    let firstFrame = true;
     function render() {
       requestAnimationFrame(render);
       const dt = Math.min(clock.getDelta(), .04);
       if (!touched) targetYaw += dt * .035;
       suitcase.rotation.y += (targetYaw - suitcase.rotation.y) * .10;
       renderer.render(scene,camera);
-      loading.style.display = 'none';
+      if (firstFrame) {
+        firstFrame = false;
+        renderer.domElement.dataset.modelReady = '1';
+        loading.style.display = 'none';
+      }
     }
     render();
   } catch (error) {

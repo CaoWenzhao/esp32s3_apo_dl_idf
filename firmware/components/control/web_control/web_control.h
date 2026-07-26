@@ -11,8 +11,6 @@ typedef enum {
 } web_control_mode_t;
 
 typedef struct {
-    const char *ap_ssid;
-    const char *ap_password;
     uint32_t command_timeout_ms;
     float max_manual_linear_mps;
     float max_manual_angular_rps;

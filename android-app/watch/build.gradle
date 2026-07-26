@@ -1,0 +1,31 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.smart.suitcase.watch'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.smart.suitcase.watch'
+        minSdk 26
+        targetSdk 35
+        versionCode 9
+        versionName '2.4'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        disable 'IconLauncherShape'
+    }
+}

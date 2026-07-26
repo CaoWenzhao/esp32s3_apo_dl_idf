@@ -111,19 +111,9 @@ config FOLLOW_ROBOT_FSR_MAX_KG
     help
         Maximum reportable weight, stored as kg × 100 (600 = 6.00 kg).
 
-comment "Web control safety gate"
+comment "Bluetooth control safety gate"
 
-config FOLLOW_ROBOT_WEB_AP_SSID
-    string "Control access point SSID"
-    default "Algorithm6-Control"
-
-config FOLLOW_ROBOT_WEB_AP_PASSWORD
-    string "Control access point password (empty means open AP)"
-    default ""
-    help
-        Set this locally with menuconfig. Do not commit a private password.
-
-config FOLLOW_ROBOT_WEB_TIMEOUT_MS
+config FOLLOW_ROBOT_CONTROL_TIMEOUT_MS
     int "Heartbeat/command timeout before safe stop (ms)"
     default 1000
     range 300 5000

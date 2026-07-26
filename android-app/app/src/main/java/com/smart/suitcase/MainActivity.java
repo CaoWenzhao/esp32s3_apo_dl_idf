@@ -45,11 +45,11 @@ import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.ConsoleMessage;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebViewClient;
 
 import java.nio.charset.StandardCharsets;
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayDeque;
 import java.util.Locale;
 import java.util.Queue;
@@ -62,19 +62,23 @@ public class MainActivity extends Activity {
     private static final UUID TELEMETRY_UUID = UUID.fromString("5f6d1002-8f3e-4c21-a7b2-3d4e5f607182");
     private static final UUID CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
     private static final int PERMISSION_REQUEST = 41;
+    private static final String PREFS = "smart_suitcase";
+    private static final String PREF_DARK_MODE = "dark_mode";
 
-    private static final int BG = Color.rgb(255, 255, 255);
-    private static final int PANEL = Color.rgb(247, 248, 250);
-    private static final int BORDER = Color.rgb(215, 220, 226);
-    private static final int TEXT = Color.rgb(17, 19, 24);
-    private static final int MUTED = Color.rgb(91, 101, 113);
+    private static int BG = Color.rgb(255, 255, 255);
+    private static int PANEL = Color.rgb(247, 248, 250);
+    private static int BORDER = Color.rgb(215, 220, 226);
+    private static int TEXT = Color.rgb(17, 19, 24);
+    private static int MUTED = Color.rgb(91, 101, 113);
     private static final int BLUE = Color.rgb(20, 113, 207);
     private static final int BLUE_DARK = Color.rgb(12, 91, 168);
     private static final int GREEN = Color.rgb(0, 139, 94);
     private static final int RED = Color.rgb(194, 24, 31);
-    private static final int SENSOR_RED = Color.rgb(253, 235, 236);
-    private static final int SENSOR_GREEN = Color.rgb(226, 246, 236);
-    private static final int CONTROL = Color.rgb(232, 236, 241);
+    private static int SENSOR_RED = Color.rgb(253, 235, 236);
+    private static int SENSOR_GREEN = Color.rgb(226, 246, 236);
+    private static int SENSOR_BAD_TEXT = Color.rgb(158, 25, 31);
+    private static int SENSOR_OK_TEXT = Color.rgb(0, 104, 68);
+    private static int CONTROL = Color.rgb(232, 236, 241);
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private BluetoothAdapter adapter;
@@ -86,8 +90,11 @@ public class MainActivity extends Activity {
     private boolean setupStarted;
     private boolean writeBusy;
     private boolean manualDisconnect;
+    private boolean modelReloadAttempted;
+    private boolean darkMode;
     private final Queue<byte[]> writeQueue = new ArrayDeque<>();
 
+    private WebView modelView;
     private TextView statusDot;
     private TextView connectionText;
     private Button connectButton;
@@ -145,9 +152,12 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        darkMode = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getBoolean(PREF_DARK_MODE, false);
+        applyPalette();
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
-        getWindow().getDecorView().setSystemUiVisibility(
+        getWindow().getDecorView().setSystemUiVisibility(darkMode ? 0 :
                 View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         buildUi();
         BluetoothManager manager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
@@ -167,9 +177,8 @@ public class MainActivity extends Activity {
 
         root.addView(new Space(this), matchHeight(dp(56)));
 
-        WebView modelView = new WebView(this);
-        modelView.setBackgroundColor(Color.WHITE);
-        modelView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        modelView = new WebView(this);
+        modelView.setBackgroundColor(BG);
         modelView.setVerticalScrollBarEnabled(false);
         modelView.setHorizontalScrollBarEnabled(false);
         WebSettings modelSettings = modelView.getSettings();
@@ -177,11 +186,34 @@ public class MainActivity extends Activity {
         modelSettings.setAllowFileAccess(true);
         modelSettings.setAllowContentAccess(true);
         modelSettings.setDomStorageEnabled(false);
+        modelSettings.setCacheMode(WebSettings.LOAD_NO_CACHE);
         modelView.setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onConsoleMessage(ConsoleMessage message) {
                 Log.d("Suitcase3D", message.message() + " @" + message.lineNumber());
                 return true;
+            }
+        });
+        modelView.setWebViewClient(new WebViewClient() {
+            private void retryModel(WebView view) {
+                if (modelReloadAttempted) return;
+                modelReloadAttempted = true;
+                view.postDelayed(view::reload, 250);
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                view.postDelayed(() -> view.evaluateJavascript(
+                        "Boolean(document.querySelector('canvas[data-model-ready=\"1\"]'))",
+                        result -> {
+                            if (!"true".equals(result)) retryModel(view);
+                        }), 1800);
+            }
+
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request,
+                                        WebResourceError error) {
+                if (request.isForMainFrame()) retryModel(view);
             }
         });
         modelView.setOnTouchListener((view, event) -> {
@@ -190,18 +222,8 @@ public class MainActivity extends Activity {
             view.getParent().requestDisallowInterceptTouchEvent(active);
             return false;
         });
-        try {
-            String modelHtml = readAsset("model/index.html");
-            String threeJs = readAsset("model/three.min.js").replace("</script>", "<\\/script>");
-            modelHtml = modelHtml.replace("<script src=\"three.min.js\"></script>",
-                    "<script>" + threeJs + "</script>");
-            modelView.loadDataWithBaseURL("https://appassets.androidplatform.net/model/",
-                    modelHtml, "text/html", "UTF-8", null);
-        } catch (IOException error) {
-            Log.e("Suitcase3D", "Unable to load bundled model", error);
-            modelView.loadData("<html><body style='font-family:sans-serif;text-align:center;padding-top:120px'>3D 模型资源加载失败</body></html>",
-                    "text/html", "UTF-8");
-        }
+        modelView.loadUrl("file:///android_asset/model/index.html?theme=" +
+                (darkMode ? "dark" : "light"));
         root.addView(modelView, matchHeight(dp(340)));
 
         TextView productName = text("SmartSuitcase", 29, TEXT, true);
@@ -249,6 +271,17 @@ public class MainActivity extends Activity {
         LinearLayout connectionAction = horizontal();
         connectionAction.setGravity(Gravity.RIGHT);
         connectionAction.addView(new Space(this), new LinearLayout.LayoutParams(0, dp(42), 1));
+        Button themeButton = button(darkMode ? "日间模式" : "夜间模式", CONTROL, 14);
+        themeButton.setTextColor(TEXT);
+        themeButton.setOnClickListener(v -> {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putBoolean(PREF_DARK_MODE, !darkMode)
+                    .apply();
+            recreate();
+        });
+        LinearLayout.LayoutParams themeLp = new LinearLayout.LayoutParams(dp(92), dp(42));
+        themeLp.setMargins(0, 0, dp(10), 0);
+        connectionAction.addView(themeButton, themeLp);
         connectButton = button("连接", BLUE, 15);
         connectButton.setOnClickListener(v -> {
             if (ready || gatt != null) {
@@ -739,7 +772,7 @@ public class MainActivity extends Activity {
 
     private void setBadge(TextView badge, boolean ok) {
         badge.setBackground(round(ok ? SENSOR_GREEN : SENSOR_RED, Color.TRANSPARENT, 0));
-        badge.setTextColor(ok ? Color.rgb(0, 104, 68) : Color.rgb(158, 25, 31));
+        badge.setTextColor(ok ? SENSOR_OK_TEXT : SENSOR_BAD_TEXT);
     }
 
     private boolean validDistance(float value) {
@@ -812,10 +845,35 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        if (modelView != null) {
+            modelView.onResume();
+            modelView.resumeTimers();
+            modelView.postDelayed(() -> modelView.evaluateJavascript(
+                    "Boolean(document.querySelector('canvas[data-model-ready=\"1\"]'))",
+                    result -> {
+                        if (!"true".equals(result)) modelView.reload();
+                    }), 400);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        if (modelView != null) modelView.onPause();
+        super.onPause();
+    }
+
+    @Override
     protected void onDestroy() {
         manualDisconnect = true;
         disconnectGatt();
         handler.removeCallbacksAndMessages(null);
+        if (modelView != null) {
+            modelView.stopLoading();
+            modelView.destroy();
+            modelView = null;
+        }
         super.onDestroy();
     }
 
@@ -825,22 +883,36 @@ public class MainActivity extends Activity {
         return view;
     }
 
-    private String readAsset(String path) throws IOException {
-        try (InputStream input = getAssets().open(path);
-             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[8192];
-            int count;
-            while ((count = input.read(buffer)) >= 0) {
-                output.write(buffer, 0, count);
-            }
-            return output.toString(StandardCharsets.UTF_8.name());
-        }
-    }
-
     private LinearLayout horizontal() {
         LinearLayout view = new LinearLayout(this);
         view.setOrientation(LinearLayout.HORIZONTAL);
         return view;
+    }
+
+    private void applyPalette() {
+        if (darkMode) {
+            BG = Color.rgb(15, 17, 21);
+            PANEL = Color.rgb(25, 29, 35);
+            BORDER = Color.rgb(55, 62, 72);
+            TEXT = Color.rgb(238, 241, 245);
+            MUTED = Color.rgb(167, 176, 188);
+            SENSOR_RED = Color.rgb(74, 35, 40);
+            SENSOR_GREEN = Color.rgb(26, 69, 51);
+            SENSOR_BAD_TEXT = Color.rgb(255, 151, 157);
+            SENSOR_OK_TEXT = Color.rgb(111, 224, 168);
+            CONTROL = Color.rgb(45, 52, 62);
+        } else {
+            BG = Color.rgb(255, 255, 255);
+            PANEL = Color.rgb(247, 248, 250);
+            BORDER = Color.rgb(215, 220, 226);
+            TEXT = Color.rgb(17, 19, 24);
+            MUTED = Color.rgb(91, 101, 113);
+            SENSOR_RED = Color.rgb(253, 235, 236);
+            SENSOR_GREEN = Color.rgb(226, 246, 236);
+            SENSOR_BAD_TEXT = Color.rgb(158, 25, 31);
+            SENSOR_OK_TEXT = Color.rgb(0, 104, 68);
+            CONTROL = Color.rgb(232, 236, 241);
+        }
     }
 
     private LinearLayout panel() {
@@ -874,7 +946,7 @@ public class MainActivity extends Activity {
     }
 
     private TextView sensorBadge(String value) {
-        TextView badge = text(value, 13, Color.rgb(158, 25, 31), true);
+        TextView badge = text(value, 13, SENSOR_BAD_TEXT, true);
         badge.setGravity(Gravity.CENTER);
         badge.setBackground(round(SENSOR_RED, Color.TRANSPARENT, 0));
         return badge;

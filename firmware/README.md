@@ -11,10 +11,10 @@
 - 左右超声波：GPIO38、GPIO39
 - FSR：GPIO8
 - 雷达任务 CPU 占用修复
-- UWB 跟随、雷达/超声波避障和网页遥控
-- 深色跟随/遥控 UI，支持跟随速度、跟随转向和遥控速度 0~100% 实时调节
+- UWB 跟随、雷达/超声波避障和 BLE 遥控
+- 手机 App 支持跟随速度、跟随转向和遥控速度 0~100% 实时调节
 
-热点名称：`Algorithm6-Control`，无密码。连接后访问 `http://192.168.4.1`。
+固件仅广播 BLE 设备 `SmartSuitcase`，不启动 Wi-Fi 热点或网页服务器。
 
 ```powershell
 cd C:\path\to\follow-2026-07-13
