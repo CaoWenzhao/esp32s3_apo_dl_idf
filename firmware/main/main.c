@@ -35,14 +35,18 @@ static const char *TAG = "algorithm6";
 #define LIDAR_FRONT_MAX_DEG 65.0f
 #define LIDAR_FRONT_MIN_DEG 295.0f
 #define TARGET_FRESH_US 2000000ULL
-#define FIELD_FRESH_US 500000ULL
+#define LIDAR_TARGET_FRESH_US 1500000ULL
+#define LIDAR_TRACK_HOLD_US 1500000ULL
+#define FIELD_FRESH_US 1200000ULL
 #define ULTRA_FRESH_US 800000ULL
 #define FSR_FRESH_US 500000ULL
 #define BATTERY_FRESH_US 500000ULL
-#define UWB_SMOOTH_TAU_S 0.08f
-#define UWB_MAX_TARGET_SPEED_MPS 12.0f
-#define UWB_JUMP_MARGIN_M 1.00f
-#define UWB_REINIT_OUTLIERS 1
+#define UWB_SMOOTH_TAU_S 0.18f
+#define UWB_FAST_TAU_S 0.045f
+#define UWB_BEARING_RATE_TAU_S 0.12f
+#define UWB_MAX_TARGET_SPEED_MPS 5.0f
+#define UWB_JUMP_MARGIN_M 0.45f
+#define UWB_REINIT_OUTLIERS 3
 #define SUITCASE_BASE_WEIGHT_KG 10.2f
 #define PRESSURE_DIVIDER_KOHM 8.67f
 #define PRESSURE_EXCITATION_V 3.3f
@@ -59,6 +63,10 @@ typedef struct {
     float target_bearing_rad;
     float target_bearing_rate_rps;
     uint64_t target_timestamp_us;
+    float lidar_target_distance_m;
+    float lidar_target_bearing_rad;
+    float lidar_target_bearing_rate_rps;
+    uint64_t lidar_target_timestamp_us;
     fa_obstacle_field_t field;
     uint64_t field_timestamp_us;
     float ultrasonic_left_m;
@@ -193,6 +201,7 @@ static void uwb_task(void *argument)
     float filtered_forward_m = 0.0f;
     float filtered_left_m = 0.0f;
     float filtered_bearing_rad = 0.0f;
+    float filtered_bearing_rate_rps = 0.0f;
     uint64_t accepted_timestamp_us = 0;
     unsigned consecutive_outliers = 0;
     while (true) {
@@ -206,8 +215,10 @@ static void uwb_task(void *argument)
         }
 
         const uint64_t timestamp_us = now_us();
-        const float forward_m = (float)twr.y_cm / 100.0f;
-        const float left_m = (float)twr.x_cm / 100.0f;
+        const float raw_forward_m = (float)twr.y_cm / 100.0f;
+        const float raw_left_m = (float)twr.x_cm / 100.0f;
+        float forward_m = raw_forward_m;
+        float left_m = raw_left_m;
         float dt = 0.0f;
         if (accepted_timestamp_us != 0 && timestamp_us > accepted_timestamp_us) {
             dt = (float)(timestamp_us - accepted_timestamp_us) / 1000000.0f;
@@ -219,13 +230,19 @@ static void uwb_task(void *argument)
                                       left_m - filtered_left_m);
             const float maximum_jump = UWB_MAX_TARGET_SPEED_MPS * dt +
                                        UWB_JUMP_MARGIN_M;
-            if (jump > maximum_jump &&
-                consecutive_outliers < UWB_REINIT_OUTLIERS) {
+            if (jump > maximum_jump) {
                 consecutive_outliers++;
-                continue;
-            }
-            if (consecutive_outliers >= UWB_REINIT_OUTLIERS) {
-                reinitialize = true;
+                if (consecutive_outliers >= UWB_REINIT_OUTLIERS) {
+                    reinitialize = true;
+                } else if (jump > 1e-4f) {
+                    const float scale = maximum_jump / jump;
+                    forward_m = filtered_forward_m +
+                                (forward_m - filtered_forward_m) * scale;
+                    left_m = filtered_left_m +
+                             (left_m - filtered_left_m) * scale;
+                }
+            } else {
+                consecutive_outliers = 0;
             }
         }
 
@@ -233,26 +250,47 @@ static void uwb_task(void *argument)
         if (reinitialize) {
             filtered_forward_m = forward_m;
             filtered_left_m = left_m;
+            filtered_bearing_rate_rps = 0.0f;
         } else {
-            const float alpha = clampf_local(dt / (UWB_SMOOTH_TAU_S + dt),
-                                             0.25f, 0.95f);
+            const float innovation_m =
+                hypotf(raw_forward_m - filtered_forward_m,
+                       raw_left_m - filtered_left_m);
+            const float innovation_speed_mps =
+                innovation_m / fmaxf(dt, 0.02f);
+            const float motion_blend =
+                clampf_local(innovation_speed_mps / 2.5f, 0.0f, 1.0f);
+            const float adaptive_tau =
+                UWB_SMOOTH_TAU_S +
+                (UWB_FAST_TAU_S - UWB_SMOOTH_TAU_S) * motion_blend;
+            const float alpha =
+                clampf_local(dt / (adaptive_tau + dt), 0.16f, 0.82f);
             filtered_forward_m += alpha * (forward_m - filtered_forward_m);
             filtered_left_m += alpha * (left_m - filtered_left_m);
         }
         filtered_bearing_rad = atan2f(filtered_left_m, filtered_forward_m);
-        const float bearing_rate_rps = filter_initialized && dt > 0.001f
-                                           ? fa_wrap_pi(filtered_bearing_rad -
-                                                        previous_bearing) / dt
-                                           : 0.0f;
+        if (filter_initialized && dt > 0.001f && !reinitialize) {
+            const float raw_bearing_rate_rps =
+                clampf_local(fa_wrap_pi(filtered_bearing_rad -
+                                        previous_bearing) / dt,
+                             -3.0f, 3.0f);
+            const float rate_alpha =
+                clampf_local(dt / (UWB_BEARING_RATE_TAU_S + dt),
+                             0.12f, 0.75f);
+            filtered_bearing_rate_rps +=
+                rate_alpha * (raw_bearing_rate_rps -
+                              filtered_bearing_rate_rps);
+        }
         filter_initialized = true;
-        consecutive_outliers = 0;
+        if (reinitialize) {
+            consecutive_outliers = 0;
+        }
         accepted_timestamp_us = timestamp_us;
 
         sensors_lock();
         s_sensors.target_distance_m = hypotf(filtered_forward_m,
                                               filtered_left_m);
         s_sensors.target_bearing_rad = filtered_bearing_rad;
-        s_sensors.target_bearing_rate_rps = bearing_rate_rps;
+        s_sensors.target_bearing_rate_rps = filtered_bearing_rate_rps;
         s_sensors.target_timestamp_us = timestamp_us;
         sensors_unlock();
     }
@@ -264,6 +302,228 @@ static float lidar_body_angle_rad(float raw_degrees)
     while (relative > 180.0f) relative -= 360.0f;
     while (relative < -180.0f) relative += 360.0f;
     return DEG_TO_RAD(relative);
+}
+
+#define LIDAR_MAX_CLUSTERS 18
+
+typedef struct {
+    float center_x_m;
+    float center_y_m;
+    float distance_m;
+    float bearing_rad;
+    float width_m;
+    int points;
+} lidar_cluster_t;
+
+typedef struct {
+    float sum_x_m;
+    float sum_y_m;
+    float first_x_m;
+    float first_y_m;
+    float last_x_m;
+    float last_y_m;
+    int points;
+} lidar_cluster_builder_t;
+
+static float lidar_sector_angle(const fa_obstacle_field_t *field, int index)
+{
+    return -0.5f * field->fov_rad +
+           ((float)index + 0.5f) * field->sector_width_rad;
+}
+
+static void finish_lidar_cluster(const lidar_cluster_builder_t *builder,
+                                 float sector_width_rad,
+                                 lidar_cluster_t clusters[],
+                                 int *cluster_count)
+{
+    if (builder->points <= 0 || *cluster_count >= LIDAR_MAX_CLUSTERS) {
+        return;
+    }
+    lidar_cluster_t *cluster = &clusters[(*cluster_count)++];
+    cluster->center_x_m = builder->sum_x_m / (float)builder->points;
+    cluster->center_y_m = builder->sum_y_m / (float)builder->points;
+    cluster->distance_m =
+        hypotf(cluster->center_x_m, cluster->center_y_m);
+    cluster->bearing_rad =
+        atan2f(cluster->center_y_m, cluster->center_x_m);
+    cluster->width_m =
+        hypotf(builder->last_x_m - builder->first_x_m,
+               builder->last_y_m - builder->first_y_m);
+    if (builder->points == 1) {
+        cluster->width_m =
+            fmaxf(0.025f, cluster->distance_m * sector_width_rad);
+    }
+    cluster->points = builder->points;
+}
+
+static bool score_lidar_candidate(float x_m, float y_m, bool leg_pair,
+                                  float anchor_x_m, float anchor_y_m,
+                                  float gate_m, float *best_score,
+                                  float *best_distance_m,
+                                  float *best_bearing_rad)
+{
+    const float distance_m = hypotf(x_m, y_m);
+    const float bearing_rad = atan2f(y_m, x_m);
+    if (distance_m < 0.35f || distance_m > 6.0f ||
+        fabsf(bearing_rad) > DEG_TO_RAD(64.0f)) {
+        return false;
+    }
+    const float position_error =
+        hypotf(x_m - anchor_x_m, y_m - anchor_y_m);
+    if (position_error > gate_m) {
+        return false;
+    }
+    const float score = position_error + (leg_pair ? -0.14f : 0.08f);
+    if (score >= *best_score) {
+        return false;
+    }
+    *best_score = score;
+    *best_distance_m = distance_m;
+    *best_bearing_rad = bearing_rad;
+    return true;
+}
+
+static bool find_lidar_follow_target(const fa_obstacle_field_t *field,
+                                     bool uwb_valid, float uwb_distance_m,
+                                     float uwb_bearing_rad, bool track_valid,
+                                     float track_distance_m,
+                                     float track_bearing_rad,
+                                     float *target_distance_m,
+                                     float *target_bearing_rad)
+{
+    if (field == NULL || target_distance_m == NULL ||
+        target_bearing_rad == NULL) {
+        return false;
+    }
+
+    const bool unanchored = !uwb_valid && !track_valid;
+    float anchor_x_m;
+    float anchor_y_m;
+    float gate_m;
+    if (uwb_valid) {
+        anchor_x_m = uwb_distance_m * cosf(uwb_bearing_rad);
+        anchor_y_m = uwb_distance_m * sinf(uwb_bearing_rad);
+        gate_m = 0.90f;
+        if (track_valid) {
+            const float track_x_m =
+                track_distance_m * cosf(track_bearing_rad);
+            const float track_y_m =
+                track_distance_m * sinf(track_bearing_rad);
+            if (hypotf(track_x_m - anchor_x_m,
+                       track_y_m - anchor_y_m) < 0.90f) {
+                anchor_x_m = 0.65f * track_x_m + 0.35f * anchor_x_m;
+                anchor_y_m = 0.65f * track_y_m + 0.35f * anchor_y_m;
+            }
+        }
+    } else if (track_valid) {
+        anchor_x_m = track_distance_m * cosf(track_bearing_rad);
+        anchor_y_m = track_distance_m * sinf(track_bearing_rad);
+        gate_m = 1.20f;
+    } else {
+        anchor_x_m = 0.0f;
+        anchor_y_m = 0.0f;
+        gate_m = INFINITY;
+    }
+
+    lidar_cluster_t clusters[LIDAR_MAX_CLUSTERS] = {0};
+    int cluster_count = 0;
+    lidar_cluster_builder_t builder = {0};
+    float previous_x_m = 0.0f;
+    float previous_y_m = 0.0f;
+
+    for (int i = 0; i < field->num_sectors; ++i) {
+        const float distance_m = field->min_dist_m[i];
+        if (distance_m >= FA_NO_OBSTACLE * 0.5f) {
+            finish_lidar_cluster(&builder, field->sector_width_rad,
+                                 clusters, &cluster_count);
+            memset(&builder, 0, sizeof(builder));
+            continue;
+        }
+        const float angle_rad = lidar_sector_angle(field, i);
+        const float x_m = distance_m * cosf(angle_rad);
+        const float y_m = distance_m * sinf(angle_rad);
+        const float adaptive_gap_m = 0.18f + 0.025f * distance_m;
+        if (builder.points > 0 &&
+            hypotf(x_m - previous_x_m, y_m - previous_y_m) >
+                adaptive_gap_m) {
+            finish_lidar_cluster(&builder, field->sector_width_rad,
+                                 clusters, &cluster_count);
+            memset(&builder, 0, sizeof(builder));
+        }
+        if (builder.points == 0) {
+            builder.first_x_m = x_m;
+            builder.first_y_m = y_m;
+        }
+        builder.sum_x_m += x_m;
+        builder.sum_y_m += y_m;
+        builder.last_x_m = x_m;
+        builder.last_y_m = y_m;
+        builder.points++;
+        previous_x_m = x_m;
+        previous_y_m = y_m;
+    }
+    finish_lidar_cluster(&builder, field->sector_width_rad,
+                         clusters, &cluster_count);
+
+    float best_score = INFINITY;
+    float best_distance_m = 0.0f;
+    float best_bearing_rad = 0.0f;
+    for (int i = 0; i < cluster_count; ++i) {
+        const lidar_cluster_t *cluster = &clusters[i];
+        if (!unanchored && cluster->width_m >= 0.025f &&
+            cluster->width_m <= 0.42f) {
+            score_lidar_candidate(
+                cluster->center_x_m, cluster->center_y_m, false,
+                anchor_x_m, anchor_y_m, gate_m, &best_score,
+                &best_distance_m, &best_bearing_rad);
+        }
+        for (int j = i + 1; j < cluster_count; ++j) {
+            const lidar_cluster_t *other = &clusters[j];
+            if (cluster->width_m > 0.38f || other->width_m > 0.38f) {
+                continue;
+            }
+            const float separation_m =
+                hypotf(cluster->center_x_m - other->center_x_m,
+                       cluster->center_y_m - other->center_y_m);
+            if (separation_m < 0.10f || separation_m > 0.75f ||
+                fabsf(cluster->distance_m - other->distance_m) > 0.55f) {
+                continue;
+            }
+            const float pair_x_m =
+                0.5f * (cluster->center_x_m + other->center_x_m);
+            const float pair_y_m =
+                0.5f * (cluster->center_y_m + other->center_y_m);
+            if (unanchored) {
+                const float pair_distance_m = hypotf(pair_x_m, pair_y_m);
+                const float pair_bearing_rad = atan2f(pair_y_m, pair_x_m);
+                if (pair_distance_m < 0.45f || pair_distance_m > 4.5f ||
+                    fabsf(pair_bearing_rad) > DEG_TO_RAD(60.0f)) {
+                    continue;
+                }
+                const float score =
+                    0.30f * pair_distance_m +
+                    0.75f * fabsf(pair_bearing_rad) +
+                    fabsf(separation_m - 0.38f);
+                if (score < best_score) {
+                    best_score = score;
+                    best_distance_m = pair_distance_m;
+                    best_bearing_rad = pair_bearing_rad;
+                }
+                continue;
+            }
+            score_lidar_candidate(
+                pair_x_m, pair_y_m, true,
+                anchor_x_m, anchor_y_m, gate_m, &best_score,
+                &best_distance_m, &best_bearing_rad);
+        }
+    }
+
+    if (!isfinite(best_score)) {
+        return false;
+    }
+    *target_distance_m = best_distance_m;
+    *target_bearing_rad = best_bearing_rad;
+    return true;
 }
 
 static float pressure_resistance_kohm(float voltage_v)
@@ -303,6 +563,10 @@ static void lidar_task(void *argument)
     rplidar_c1_t *lidar = (rplidar_c1_t *)argument;
     fa_obstacle_field_t working;
     uint32_t points_since_yield = 0;
+    float tracked_distance_m = 0.0f;
+    float tracked_bearing_rad = 0.0f;
+    float tracked_bearing_rate_rps = 0.0f;
+    uint64_t tracked_timestamp_us = 0;
     fa_obstacle_reset(&working, LIDAR_SECTORS, LIDAR_FOV_RAD);
     while (true) {
         rplidar_c1_point_t point = {0};
@@ -327,9 +591,65 @@ static void lidar_task(void *argument)
         }
 
         if (point.start_bit) {
+            const uint64_t timestamp_us = now_us();
+            float uwb_distance_m = 0.0f;
+            float uwb_bearing_rad = 0.0f;
+            uint64_t uwb_timestamp_us = 0;
+            sensors_lock();
+            uwb_distance_m = s_sensors.target_distance_m;
+            uwb_bearing_rad = s_sensors.target_bearing_rad;
+            uwb_timestamp_us = s_sensors.target_timestamp_us;
+            sensors_unlock();
+
+            const bool uwb_valid =
+                is_fresh(timestamp_us, uwb_timestamp_us, TARGET_FRESH_US);
+            const bool track_valid =
+                is_fresh(timestamp_us, tracked_timestamp_us,
+                         LIDAR_TRACK_HOLD_US);
+            float detected_distance_m = 0.0f;
+            float detected_bearing_rad = 0.0f;
+            if (find_lidar_follow_target(
+                    &working, uwb_valid, uwb_distance_m, uwb_bearing_rad,
+                    track_valid, tracked_distance_m, tracked_bearing_rad,
+                    &detected_distance_m, &detected_bearing_rad)) {
+                float dt = 0.0f;
+                if (tracked_timestamp_us != 0 &&
+                    timestamp_us > tracked_timestamp_us) {
+                    dt = (float)(timestamp_us - tracked_timestamp_us) /
+                         1000000.0f;
+                }
+                if (track_valid && dt > 0.001f) {
+                    const float bearing_step =
+                        fa_wrap_pi(detected_bearing_rad -
+                                   tracked_bearing_rad);
+                    const float raw_rate =
+                        clampf_local(bearing_step / dt, -4.0f, 4.0f);
+                    tracked_bearing_rate_rps +=
+                        0.40f * (raw_rate - tracked_bearing_rate_rps);
+                    tracked_bearing_rad =
+                        fa_wrap_pi(tracked_bearing_rad +
+                                   0.55f * bearing_step);
+                    tracked_distance_m +=
+                        0.55f * (detected_distance_m -
+                                 tracked_distance_m);
+                } else {
+                    tracked_distance_m = detected_distance_m;
+                    tracked_bearing_rad = detected_bearing_rad;
+                    tracked_bearing_rate_rps = 0.0f;
+                }
+                tracked_timestamp_us = timestamp_us;
+            }
+
             sensors_lock();
             s_sensors.field = working;
-            s_sensors.field_timestamp_us = now_us();
+            s_sensors.field_timestamp_us = timestamp_us;
+            if (tracked_timestamp_us == timestamp_us) {
+                s_sensors.lidar_target_distance_m = tracked_distance_m;
+                s_sensors.lidar_target_bearing_rad = tracked_bearing_rad;
+                s_sensors.lidar_target_bearing_rate_rps =
+                    tracked_bearing_rate_rps;
+                s_sensors.lidar_target_timestamp_us = timestamp_us;
+            }
             sensors_unlock();
             fa_obstacle_reset(&working, LIDAR_SECTORS, LIDAR_FOV_RAD);
         }
@@ -390,7 +710,7 @@ static void fsr_task(void *argument)
                 s_sensors.fsr_weight_kg =
                     SUITCASE_BASE_WEIGHT_KG + force_kg;
                 s_sensors.fsr_timestamp_us = timestamp_us;
-                if (++pressure_log_divider >= 2U) {
+                if (++pressure_log_divider >= 10U) {
                     pressure_log_divider = 0;
                     ESP_LOGI("pressure",
                              "force=%.2fkg total=%.2fkg raw=%d adc=%.3fV sensor_R=%.1fkOhm",
@@ -486,6 +806,56 @@ static const char *follow_state_name(fa_state_t state)
     }
 }
 
+static fa_target_t fuse_follow_targets(const fa_target_t *uwb,
+                                       float uwb_age_s,
+                                       const fa_target_t *lidar,
+                                       const char **source)
+{
+    if (uwb->valid && lidar->valid) {
+        const float uwb_x = uwb->distance_m * cosf(uwb->bearing_rad);
+        const float uwb_y = uwb->distance_m * sinf(uwb->bearing_rad);
+        const float lidar_x =
+            lidar->distance_m * cosf(lidar->bearing_rad);
+        const float lidar_y =
+            lidar->distance_m * sinf(lidar->bearing_rad);
+        const float disagreement =
+            hypotf(uwb_x - lidar_x, uwb_y - lidar_y);
+
+        if (disagreement <= 0.85f) {
+            fa_target_t fused = *uwb;
+            /* UWB produced the most stable follow behaviour on this chassis.
+             * Lidar remains a gentle short-term correction and the fallback
+             * when UWB drops, rather than steering the target estimate. */
+            const float fused_x = 0.85f * uwb_x + 0.15f * lidar_x;
+            const float fused_y = 0.85f * uwb_y + 0.15f * lidar_y;
+            fused.distance_m = hypotf(fused_x, fused_y);
+            fused.bearing_rad = atan2f(fused_y, fused_x);
+            fused.bearing_rate_rps =
+                0.85f * uwb->bearing_rate_rps +
+                0.15f * lidar->bearing_rate_rps;
+            *source = "FUSED";
+            return fused;
+        }
+
+        if (uwb_age_s > 0.35f) {
+            *source = "LIDAR";
+            return *lidar;
+        }
+        *source = "UWB";
+        return *uwb;
+    }
+    if (uwb->valid) {
+        *source = "UWB";
+        return *uwb;
+    }
+    if (lidar->valid) {
+        *source = "LIDAR";
+        return *lidar;
+    }
+    *source = "NONE";
+    return (fa_target_t){0};
+}
+
 static void control_task(void *argument)
 {
     chassis_t *chassis = (chassis_t *)argument;
@@ -504,6 +874,8 @@ static void control_task(void *argument)
         previous_us = current_us;
         if (dt <= 0.0f || dt > 0.2f) dt = 0.02f;
 
+        fa_target_t uwb_target = {0};
+        fa_target_t lidar_target = {0};
         fa_target_t target = {0};
         fa_obstacle_field_t field;
         fa_range_t ultrasonic_left = {0};
@@ -519,12 +891,23 @@ static void control_task(void *argument)
         float battery_adc_voltage_v;
         int battery_raw;
         uint64_t battery_timestamp_us;
+        uint64_t uwb_timestamp_us;
+        uint64_t lidar_target_timestamp_us;
         sensors_lock();
-        target.valid = is_fresh(current_us, s_sensors.target_timestamp_us,
-                                TARGET_FRESH_US);
-        target.distance_m = s_sensors.target_distance_m;
-        target.bearing_rad = s_sensors.target_bearing_rad;
-        target.bearing_rate_rps = s_sensors.target_bearing_rate_rps;
+        uwb_timestamp_us = s_sensors.target_timestamp_us;
+        uwb_target.valid = is_fresh(current_us, uwb_timestamp_us,
+                                    TARGET_FRESH_US);
+        uwb_target.distance_m = s_sensors.target_distance_m;
+        uwb_target.bearing_rad = s_sensors.target_bearing_rad;
+        uwb_target.bearing_rate_rps = s_sensors.target_bearing_rate_rps;
+        lidar_target_timestamp_us = s_sensors.lidar_target_timestamp_us;
+        lidar_target.valid =
+            is_fresh(current_us, lidar_target_timestamp_us,
+                     LIDAR_TARGET_FRESH_US);
+        lidar_target.distance_m = s_sensors.lidar_target_distance_m;
+        lidar_target.bearing_rad = s_sensors.lidar_target_bearing_rad;
+        lidar_target.bearing_rate_rps =
+            s_sensors.lidar_target_bearing_rate_rps;
         const bool have_field = is_fresh(current_us, s_sensors.field_timestamp_us,
                                          FIELD_FRESH_US);
         field = s_sensors.field;
@@ -546,6 +929,19 @@ static void control_task(void *argument)
         battery_raw = s_sensors.battery_raw;
         battery_timestamp_us = s_sensors.battery_timestamp_us;
         sensors_unlock();
+
+        const float uwb_age_s =
+            uwb_timestamp_us != 0 && current_us >= uwb_timestamp_us
+                ? (float)(current_us - uwb_timestamp_us) / 1000000.0f
+                : INFINITY;
+        const char *target_source = "NONE";
+        target = fuse_follow_targets(&uwb_target, uwb_age_s, &lidar_target,
+                                     &target_source);
+        float measured_v_before = 0.0f;
+        float measured_w_before = 0.0f;
+        chassis_get_measured(chassis, &measured_v_before,
+                             &measured_w_before, NULL, NULL);
+        target.vehicle_yaw_rate_rps = measured_w_before;
 
         float lidar_front_m = 0.0f;
         if (have_field) {
@@ -603,7 +999,7 @@ static void control_task(void *argument)
         chassis_get_measured(chassis, &measured_v, &measured_w, NULL, NULL);
         web_control_telemetry_t telemetry = {
             .state = state_name,
-            .uwb_ok = target.valid,
+            .uwb_ok = uwb_target.valid,
             .lidar_ok = have_field,
             .ultrasonic_left_ok = ultrasonic_left.valid,
             .ultrasonic_right_ok = ultrasonic_right.valid,
@@ -633,8 +1029,9 @@ static void control_task(void *argument)
 
         if (++log_counter >= (unsigned)CONFIG_FOLLOW_ROBOT_CONTROL_HZ) {
             log_counter = 0;
-            ESP_LOGI(TAG, "%s target=%d d=%.2f bearing=%+.2f cmd=%+.2f/%+.2f pulses=%d/%d | lidar=%d ultra=%d/%d fsr=%d raw=%d adc=%.3fV weight=%.2fkg frames=%lu/%lu rmt_evt=%lu/%lu sym=%u/%u bytes=%lu/%lu front=%.2f left=%.2f right=%.2f heading=%+.1fdeg",
-                     state_name, target.valid, target.distance_m,
+            ESP_LOGI(TAG, "%s src=%s target=%d uwb=%d lidar_track=%d d=%.2f bearing=%+.2f cmd=%+.2f/%+.2f pulses=%d/%d | lidar=%d ultra=%d/%d fsr=%d raw=%d adc=%.3fV weight=%.2fkg frames=%lu/%lu rmt_evt=%lu/%lu sym=%u/%u bytes=%lu/%lu front=%.2f left=%.2f right=%.2f heading=%+.1fdeg",
+                     state_name, target_source, target.valid,
+                     uwb_target.valid, lidar_target.valid, target.distance_m,
                      target.bearing_rad, output.v_mps, output.omega_rps,
                      telemetry.left_pulse_us, telemetry.right_pulse_us,
                      have_field, ultrasonic_left.valid, ultrasonic_right.valid,
@@ -679,7 +1076,7 @@ static bool start_task_on_core(TaskFunction_t function, const char *name,
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Follow control starting: filtered UWB + lidar clearance + slew-limited ESC output");
+    ESP_LOGI(TAG, "Hybrid follow starting: UWB/LiDAR target fusion + encoder-closed-loop drive");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {

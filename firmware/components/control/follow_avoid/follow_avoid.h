@@ -44,6 +44,7 @@ typedef struct {
     float distance_m;    /* range to the user */
     float bearing_rad;   /* direction to the user in the body frame (see above) */
     float bearing_rate_rps; /* filtered target bearing rate */
+    float vehicle_yaw_rate_rps; /* encoder/IMU estimate, + = left */
 } fa_target_t;
 
 /* A single ultrasonic reading (front-corner). */
@@ -117,6 +118,11 @@ typedef struct {
     float avoid_forward_mps;   /* straight escape speed after the turn */
     float robot_half_width_m;  /* widens blocked sectors to robot's footprint */
     float front_cone_rad;      /* half-angle of the cone used for the governor */
+    float predictive_distance_m; /* far-path lidar look-ahead distance */
+    float predictive_margin_m; /* extra corridor width beyond the suitcase */
+    float predictive_max_heading_rad; /* largest early-avoidance offset */
+    float predictive_max_angular_rps; /* gentle steering cap before near avoid */
+    float predictive_min_speed_scale; /* speed floor during early avoidance */
 
     /* Search / escape */
     float search_angular_rps;

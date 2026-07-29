@@ -44,7 +44,7 @@ config FOLLOW_ROBOT_MAX_LINEAR_MMPS
 
 config FOLLOW_ROBOT_MAX_ANGULAR_MRADPS
     int "Maximum automatic angular speed (mrad/s)"
-    default 1600
+    default 2400
 
 config FOLLOW_ROBOT_EMERGENCY_DIST_MM
     int "Obstacle emergency distance (mm)"
@@ -60,7 +60,7 @@ config FOLLOW_ROBOT_SAFE_DIST_MM
 
 config FOLLOW_ROBOT_ROBOT_HALF_WIDTH_MM
     int "Robot half-width used for obstacle inflation (mm)"
-    default 220
+    default 200
 
 config FOLLOW_ROBOT_LIDAR_FORWARD_DEG
     int "RPLIDAR raw angle aligned with vehicle forward (degrees)"

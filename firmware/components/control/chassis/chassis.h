@@ -63,7 +63,7 @@ typedef struct {
     int esc_period_us;         /* 20000 (= 1/50 Hz) */
     int esc_min_us;            /* 1000 = full reverse */
     int esc_mid_us;            /* 1500 = neutral / stop */
-    int esc_max_us;            /* 2000 = full forward */
+    int esc_max_us;            /* Configured full-forward pulse */
     int pwm_resolution_bits;   /* 14 -> plenty for 50 Hz pulse timing */
     int ledc_speed_mode;       /* LEDC_LOW_SPEED_MODE on ESP32-S3 */
     int ledc_timer;            /* LEDC_TIMER_0.. */
@@ -127,6 +127,8 @@ typedef struct {
     float since_setpoint_s;    /* fail-safe watchdog */
     float left_stall_s;
     float right_stall_s;
+    bool left_encoder_seen;
+    bool right_encoder_seen;
     bool encoder_fault_latched;
 
     /* dead-reckoning odometry (from encoders) */

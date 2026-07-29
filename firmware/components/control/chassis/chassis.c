@@ -142,6 +142,21 @@ static float slew(float target, float current, float max_step)
     return current + d;
 }
 
+static float slew_esc_pulse(float target, float current, float neutral,
+                            float base_rate_us_per_s, float dt_s)
+{
+    const float current_offset = current - neutral;
+    const float target_offset = target - neutral;
+    const bool reversing = current_offset * target_offset < 0.0f;
+    if (reversing) {
+        target = neutral;
+    }
+    const bool braking =
+        reversing || fabsf(target - neutral) < fabsf(current_offset);
+    const float rate = base_rate_us_per_s * (braking ? 4.0f : 1.0f);
+    return slew(target, current, rate * dt_s);
+}
+
 static esp_err_t cfg_esc_channel(const chassis_config_t *cfg, int channel,
                                  int gpio)
 {
@@ -362,6 +377,12 @@ esp_err_t chassis_update(chassis_t *ch, float dt_s)
     const float right_dist = (float)dr / tpm;
     ch->meas_left_mps = left_dist / dt_s;
     ch->meas_right_mps = right_dist / dt_s;
+    if (fabsf(ch->meas_left_mps) >= cfg->encoder_min_feedback_mps) {
+        ch->left_encoder_seen = true;
+    }
+    if (fabsf(ch->meas_right_mps) >= cfg->encoder_min_feedback_mps) {
+        ch->right_encoder_seen = true;
+    }
 
     const bool left_commanded =
         fabsf(ch->target_left_mps) >= cfg->encoder_min_command_mps;
@@ -397,10 +418,26 @@ esp_err_t chassis_update(chassis_t *ch, float dt_s)
     const float tl = clampf(ch->target_left_mps, -vmax, vmax);
     const float tr = clampf(ch->target_right_mps, -vmax, vmax);
 
-    float off_l = ch->ff_us_per_mps * tl +
-                  chassis_pid_step(&ch->pid_l, tl, ch->meas_left_mps, dt_s);
-    float off_r = ch->ff_us_per_mps * tr +
-                  chassis_pid_step(&ch->pid_r, tr, ch->meas_right_mps, dt_s);
+    const bool left_feedback_ok =
+        ch->left_encoder_seen &&
+        (!left_commanded || ch->left_stall_s < 0.35f);
+    const bool right_feedback_ok =
+        ch->right_encoder_seen &&
+        (!right_commanded || ch->right_stall_s < 0.35f);
+    float off_l = ch->ff_us_per_mps * tl;
+    float off_r = ch->ff_us_per_mps * tr;
+    if (left_feedback_ok) {
+        off_l +=
+            chassis_pid_step(&ch->pid_l, tl, ch->meas_left_mps, dt_s);
+    } else {
+        chassis_pid_reset(&ch->pid_l);
+    }
+    if (right_feedback_ok) {
+        off_r +=
+            chassis_pid_step(&ch->pid_r, tr, ch->meas_right_mps, dt_s);
+    } else {
+        chassis_pid_reset(&ch->pid_r);
+    }
 
     /* A zero target means "stop": force neutral and drop the integrator so the
      * ESC does not creep. */
@@ -417,10 +454,15 @@ esp_err_t chassis_update(chassis_t *ch, float dt_s)
     float pulse_r =
         (float)cfg->esc_mid_us + (cfg->right_invert ? -off_r : off_r);
 
-    /* Slew-limit the pulse for current-spike / gearbox protection. */
-    const float max_step = cfg->slew_us_per_s * dt_s;
-    pulse_l = slew(pulse_l, ch->cmd_pulse_l_us, max_step);
-    pulse_r = slew(pulse_r, ch->cmd_pulse_r_us, max_step);
+    /* Keep the requested acceleration ramp, but return toward neutral much
+     * faster. This preserves top speed while removing the long powered coast
+     * that otherwise makes a fast pivot overshoot. */
+    pulse_l = slew_esc_pulse(pulse_l, ch->cmd_pulse_l_us,
+                             (float)cfg->esc_mid_us,
+                             cfg->slew_us_per_s, dt_s);
+    pulse_r = slew_esc_pulse(pulse_r, ch->cmd_pulse_r_us,
+                             (float)cfg->esc_mid_us,
+                             cfg->slew_us_per_s, dt_s);
     ch->cmd_pulse_l_us = pulse_l;
     ch->cmd_pulse_r_us = pulse_r;
 
